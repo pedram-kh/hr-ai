@@ -8,7 +8,13 @@ retrieval substrate:
 - `/extract-salary` — parse a salary `.xlsx` and RETURN structured rows
                (extract-and-return; hr-backend writes the salary tables).
 - `/retrieve` — scope-prefilter (WHERE) then EXACT similarity ranking; full
-               recall (catch 2). No router/answer LLM (that is 2b).
+               recall (catch 2). No router (that is 2b-2).
+- `/synthesise` — Sprint 2b-1 (ADR-0015): compose a CITED answer grounded ONLY
+               in the eligible chunks hr-backend passes, honouring the
+               convenio-over-baseline precedence rule. The provider is pluggable
+               (default Claude). The API key arrives PER CALL from hr-backend and
+               is NEVER stored, logged, or persisted here. hr-backend owns the
+               answer-or-escalate decision; this endpoint only synthesises.
 
 hr-ai still NEVER migrates and writes NO table other than `document_chunks`.
 """
@@ -68,6 +74,31 @@ class RetrieveRequest(BaseModel):
     k: int = 8
 
 
+class SynthesisChunk(BaseModel):
+    chunk_id: int
+    document_id: int
+    page_from: int | None = None
+    page_to: int | None = None
+    content: str
+    score: float = 0.0
+    authority_level: str | None = None
+
+
+class ProviderConfigBody(BaseModel):
+    provider: str = "claude"
+    model: str
+    endpoint: str | None = None
+
+
+class SynthesiseRequest(BaseModel):
+    question: str
+    chunks: list[SynthesisChunk]
+    # The decrypted answer-model key, owned by hr-backend, passed in the BODY
+    # (never a header) per call. Used for this one request only; never persisted.
+    provider_api_key: str
+    provider_config: ProviderConfigBody
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Liveness probe."""
@@ -93,7 +124,11 @@ async def health_config() -> dict[str, object]:
     return {
         "embed_model": settings.embed_model,
         "embed_dim": settings.embed_dim,
-        "anthropic_api_key_configured": bool(settings.anthropic_api_key),
+        # The answer model is external + pluggable (ADR-0015). These are NON-SECRET.
+        # The key is NOT held here — it arrives per call from hr-backend.
+        "answer_provider": settings.answer_provider,
+        "answer_model": settings.answer_model,
+        "answer_endpoint": settings.answer_endpoint,
     }
 
 
@@ -175,3 +210,52 @@ async def retrieve_endpoint(req: RetrieveRequest) -> JSONResponse:
         return JSONResponse({"chunks": chunks, "eligible_total": eligible_total})
     except Exception as exc:  # noqa: BLE001 - surface retrieval failure
         return JSONResponse({"status": "error", "detail": str(exc)}, status_code=502)
+
+
+@app.post("/synthesise", dependencies=[Depends(require_internal_token)])
+def synthesise(req: SynthesiseRequest) -> JSONResponse:
+    """Compose a CITED answer grounded ONLY in the provided chunks (ADR-0015).
+
+    The provider is pluggable (default Claude). The decrypted key arrives in the
+    body per call and is NEVER stored, logged, or persisted. The precedence rule
+    (convenio over national-law baseline) is encoded in the prompt; `authority_used`
+    is computed deterministically from the cited chunks for the audit trail.
+
+    On a provider failure this returns 200 with `{ "error": "provider_error", ... }`
+    (the key is never echoed) so hr-backend can escalate (low_confidence) cleanly.
+    """
+    from .providers import ChunkInput, ProviderConfig, get_provider
+
+    try:
+        provider = get_provider(req.provider_config.provider)
+        chunks = [
+            ChunkInput(
+                chunk_id=c.chunk_id,
+                document_id=c.document_id,
+                page_from=c.page_from,
+                page_to=c.page_to,
+                content=c.content,
+                score=c.score,
+                authority_level=c.authority_level,
+            )
+            for c in req.chunks
+        ]
+        config = ProviderConfig(
+            provider=req.provider_config.provider,
+            model=req.provider_config.model,
+            endpoint=req.provider_config.endpoint,
+        )
+        result = provider.synthesise(req.question, chunks, req.provider_api_key, config)
+        return JSONResponse(
+            {
+                "answer": result.answer,
+                "citations": result.citations,
+                "grounding_signal": result.grounding_signal,
+                "confidence": result.confidence,
+                "authority_used": result.authority_used,
+                "trace_fragment": result.trace_fragment,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - provider/parse failure → escalation
+        # NEVER include the request body (it carries the key). Only the message.
+        return JSONResponse({"error": "provider_error", "detail": str(exc)}, status_code=200)

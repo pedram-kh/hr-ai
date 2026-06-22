@@ -61,7 +61,19 @@ class Settings(BaseSettings):
     # catch-1 correctness win and the primary furniture rule.
     chunk_repeat_furniture_min_page_fraction: float = 0.30
 
-    # --- LLM (unused this sprint — 2b) ---
+    # --- Answer synthesis (Sprint 2b-1, ADR-0015) ---
+    # The answer model is EXTERNAL and PLUGGABLE (quality-dominant trade, unlike
+    # the self-hosted embedding model — ADR-0006). These are NON-SECRET settings:
+    # which provider, which model, which endpoint. The API key is NOT here — it is
+    # owned by hr-backend (encrypted at rest) and passed per synthesis call.
+    # ANSWER_MODEL / ANSWER_ENDPOINT MUST point at an EU-available model/endpoint
+    # (GDPR is deploy-time — deploy.md §1: EU endpoint, signed DPA, zero-retention).
+    answer_provider: str = "claude"
+    answer_model: str = "claude-sonnet-4-5"
+    answer_endpoint: str = "https://api.anthropic.com"
+
+    # DEPRECATED placeholder kept for /health/config back-compat; the real key is
+    # never stored in hr-ai (ADR-0015) — it arrives per call from hr-backend.
     anthropic_api_key: str = ""
 
 

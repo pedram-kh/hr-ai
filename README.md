@@ -17,7 +17,16 @@ Python + FastAPI service for the HR platform's RAG and reasoning pipeline. See
 >
 > `document_chunks` is the **only** table hr-ai writes, via a dedicated, scoped
 > `hr_ai` Postgres role (ADR-0007 enforced at the DB). It still **never
-> migrates**. No router / answer LLM / guardrail yet (that is 2b).
+> migrates**.
+>
+> **Sprint 2b-1: answer synthesis (ADR-0015).** Adds `POST /synthesise` — compose
+> a **cited** answer grounded *only* in the eligible chunks `hr-backend` passes,
+> honouring the **convenio-over-`national_law` precedence rule** (encoded in the
+> prompt; `authority_used` returned for the audit trace). The provider is
+> **pluggable** (`app/providers/`, default Claude); the API key arrives in the
+> request **body per call** and is **never stored, logged, or persisted** here —
+> `hr-backend` owns it (ADR-0015) and owns the answer-or-escalate decision. The
+> router, full grounding check, and salary-in-chat are **2b-2**.
 
 ## Requirements
 
@@ -46,7 +55,9 @@ uvicorn app.main:app --reload --port 8001
 
 - `GET /health` → `{ "status": "ok", "service": "hr-ai" }` (liveness)
 - `GET /health/db` → DB connectivity check; `200`/`503`
-- `GET /health/config` → echoes non-secret config (`EMBED_MODEL`, `EMBED_DIM`, …)
+- `GET /health/config` → echoes non-secret config (`EMBED_MODEL`, `EMBED_DIM`,
+  `ANSWER_PROVIDER`, `ANSWER_MODEL`, `ANSWER_ENDPOINT` — the answer key is **not**
+  here; it arrives per call from `hr-backend`)
 - `POST /extract` (**internal**) — body `{ storage_key, document_uuid }`. PDF →
   per-page text + page-image S3 keys (Sprint 1). `hr-backend` persists the rows.
 - `POST /embed` (**internal**) — body
@@ -68,6 +79,16 @@ uvicorn app.main:app --reload --port 8001
   scope-prefilters `document_chunks`, ranks by an **exact flat scan** (full
   recall — the ANN layer never drops an eligible chunk), returns
   `{ chunks:[{ …, score }], eligible_total }`.
+- `POST /synthesise` (**internal**, ADR-0015) — body `{ question,
+  chunks:[{ chunk_id, document_id, page_from, page_to, content, score,
+  authority_level }], provider_api_key, provider_config:{ provider, model,
+  endpoint } }`. Composes a cited answer grounded only in `chunks`, applying the
+  convenio-over-baseline precedence rule. Returns `{ answer,
+  citations:[{ chunk_id, document_id, page_from, page_to, authority_level }],
+  grounding_signal:{ grounded, citation_count, top_chunk_score }, confidence,
+  authority_used:[…], trace_fragment }`. On a provider failure: `200` with
+  `{ error:"provider_error", detail }` (the key is never echoed) so `hr-backend`
+  escalates cleanly. **The key is used for this one call only — never persisted.**
 
 ## Sanity test (BGE-M3 / 1024 go-no-go)
 
