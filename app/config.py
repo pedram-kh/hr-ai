@@ -72,6 +72,16 @@ class Settings(BaseSettings):
     answer_model: str = "claude-sonnet-4-5"
     answer_endpoint: str = "https://api.anthropic.com"
 
+    # --- Question router (Sprint 2b-2, ADR-0016) ---
+    # The router is a SMALL/FAST model classification call (salary | prose |
+    # off_domain) reusing the SAME pluggable provider + hr-backend-owned key path
+    # (ADR-0015). The model is NON-SECRET config and MAY differ from the answer
+    # model (smaller is fine). The endpoint defaults to ANSWER_ENDPOINT; if it
+    # differs it MUST still be EU (deploy.md §1). The per-claim grounding check
+    # (§5) deliberately uses ANSWER_MODEL, not this — entailment is subtle.
+    router_model: str = "claude-haiku-4-5"
+    router_endpoint: str = ""  # empty → falls back to answer_endpoint
+
     # DEPRECATED placeholder kept for /health/config back-compat; the real key is
     # never stored in hr-ai (ADR-0015) — it arrives per call from hr-backend.
     anthropic_api_key: str = ""

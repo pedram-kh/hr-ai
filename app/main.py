@@ -99,6 +99,34 @@ class SynthesiseRequest(BaseModel):
     provider_config: ProviderConfigBody
 
 
+class RouteRequest(BaseModel):
+    """Router classification (Sprint 2b-2, ADR-0016). Sees the QUESTION only —
+    never the chunks (the same privacy posture as /synthesise). The provider_config
+    carries the SMALL/FAST router model. The key is hr-backend-owned, per call."""
+
+    question: str
+    provider_api_key: str
+    provider_config: ProviderConfigBody
+
+
+class GroundChunkBody(BaseModel):
+    chunk_id: int
+    content: str
+    authority_level: str | None = None
+    is_tabular: bool = False
+
+
+class GroundRequest(BaseModel):
+    """Per-claim entailment grounding (Sprint 2b-2 §5). Uses the CAPABLE answer
+    model (entailment is subtle). `chunks` are the CITED chunks only."""
+
+    question: str
+    answer: str
+    chunks: list[GroundChunkBody]
+    provider_api_key: str
+    provider_config: ProviderConfigBody
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Liveness probe."""
@@ -129,6 +157,9 @@ async def health_config() -> dict[str, object]:
         "answer_provider": settings.answer_provider,
         "answer_model": settings.answer_model,
         "answer_endpoint": settings.answer_endpoint,
+        # The router (ADR-0016) — small/fast model, same key path. NON-SECRET.
+        "router_model": settings.router_model,
+        "router_endpoint": settings.router_endpoint or settings.answer_endpoint,
     }
 
 
@@ -258,4 +289,77 @@ def synthesise(req: SynthesiseRequest) -> JSONResponse:
         )
     except Exception as exc:  # noqa: BLE001 - provider/parse failure → escalation
         # NEVER include the request body (it carries the key). Only the message.
+        return JSONResponse({"error": "provider_error", "detail": str(exc)}, status_code=200)
+
+
+@app.post("/route", dependencies=[Depends(require_internal_token)])
+def route(req: RouteRequest) -> JSONResponse:
+    """Classify the question salary | prose | off_domain and decompose a compound
+    question into subqueries (ADR-0016). Small/fast model. Runs AFTER hr-backend's
+    hardcoded guardrail baseline (sensitive / other-employee never reach here).
+
+    On a provider failure this returns 200 with `{ "error": "provider_error", ... }`
+    so hr-backend stays FAIL-SAFE (the safe prose+floor path), never a misroute.
+    """
+    from .providers import ProviderConfig, get_provider
+
+    try:
+        provider = get_provider(req.provider_config.provider)
+        config = ProviderConfig(
+            provider=req.provider_config.provider,
+            model=req.provider_config.model,
+            endpoint=req.provider_config.endpoint,
+        )
+        result = provider.classify(req.question, req.provider_api_key, config)
+        return JSONResponse(
+            {
+                "label": result.label,
+                "confidence": result.confidence,
+                "subqueries": result.subqueries,
+                "reason": result.reason,
+                "trace_fragment": result.trace_fragment,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - never echo the body (it carries the key)
+        return JSONResponse({"error": "provider_error", "detail": str(exc)}, status_code=200)
+
+
+@app.post("/ground", dependencies=[Depends(require_internal_token)])
+def ground(req: GroundRequest) -> JSONResponse:
+    """Per-claim entailment of a prose answer against its CITED chunks (Sprint
+    2b-2 §5) — the REAL grounding gate. Uses the CAPABLE answer model (entailment
+    is subtle; never the cheap router model). Table-aware (digit-presence is not
+    entailment — Q5's lesson). Salary answers are SQL-grounded and skip this.
+
+    On a provider failure this returns 200 with `{ "error": "provider_error", ... }`
+    so hr-backend escalates (low_confidence) — never surfaces an unverified answer.
+    """
+    from .providers import GroundChunk, ProviderConfig, get_provider
+
+    try:
+        provider = get_provider(req.provider_config.provider)
+        chunks = [
+            GroundChunk(
+                chunk_id=c.chunk_id,
+                content=c.content,
+                authority_level=c.authority_level,
+                is_tabular=c.is_tabular,
+            )
+            for c in req.chunks
+        ]
+        config = ProviderConfig(
+            provider=req.provider_config.provider,
+            model=req.provider_config.model,
+            endpoint=req.provider_config.endpoint,
+        )
+        result = provider.ground(req.question, req.answer, chunks, req.provider_api_key, config)
+        return JSONResponse(
+            {
+                "grounded": result.grounded,
+                "claims": result.claims,
+                "ungrounded": result.ungrounded,
+                "trace_fragment": result.trace_fragment,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - never echo the body (it carries the key)
         return JSONResponse({"error": "provider_error", "detail": str(exc)}, status_code=200)

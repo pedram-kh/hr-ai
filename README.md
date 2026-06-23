@@ -25,8 +25,23 @@ Python + FastAPI service for the HR platform's RAG and reasoning pipeline. See
 > prompt; `authority_used` returned for the audit trace). The provider is
 > **pluggable** (`app/providers/`, default Claude); the API key arrives in the
 > request **body per call** and is **never stored, logged, or persisted** here —
-> `hr-backend` owns it (ADR-0015) and owns the answer-or-escalate decision. The
-> router, full grounding check, and salary-in-chat are **2b-2**.
+> `hr-backend` owns it (ADR-0015) and owns the answer-or-escalate decision.
+>
+> **Sprint 2b-2: the router + per-claim grounding (ADR-0016).** Adds two more
+> provider calls on the **same** key path (key in the body, per call, never
+> persisted):
+> - `POST /route` — a **small/fast** model (`ROUTER_MODEL`) classifies the
+>   question `salary` \| `prose` \| `off_domain` and decomposes a **compound**
+>   question into `subqueries`. Sees the question only (never the chunks);
+>   `hr-backend`'s guardrail baseline fires first, so sensitive/other-employee
+>   never reach it. Fail-safe by contract: a parse/transport failure returns a
+>   low-confidence prose result.
+> - `POST /ground` — the **per-claim entailment** grounding check using the
+>   **capable answer model** (entailment is subtle — never the cheap router
+>   model). **Table-aware**: digit-presence in a tabular chunk is not entailment.
+> Synthesis also now **renumbers the `[Fuente N]` markers** to the cited subset
+> (1..M) so they map 1:1 to the displayed sources. Salary-in-chat is SQL in
+> `hr-backend` (not here — ADR-0006).
 
 ## Requirements
 
@@ -56,8 +71,9 @@ uvicorn app.main:app --reload --port 8001
 - `GET /health` → `{ "status": "ok", "service": "hr-ai" }` (liveness)
 - `GET /health/db` → DB connectivity check; `200`/`503`
 - `GET /health/config` → echoes non-secret config (`EMBED_MODEL`, `EMBED_DIM`,
-  `ANSWER_PROVIDER`, `ANSWER_MODEL`, `ANSWER_ENDPOINT` — the answer key is **not**
-  here; it arrives per call from `hr-backend`)
+  `ANSWER_PROVIDER`, `ANSWER_MODEL`, `ANSWER_ENDPOINT`, `ROUTER_MODEL`,
+  `ROUTER_ENDPOINT` — the answer key is **not** here; it arrives per call from
+  `hr-backend`)
 - `POST /extract` (**internal**) — body `{ storage_key, document_uuid }`. PDF →
   per-page text + page-image S3 keys (Sprint 1). `hr-backend` persists the rows.
 - `POST /embed` (**internal**) — body
@@ -89,6 +105,19 @@ uvicorn app.main:app --reload --port 8001
   authority_used:[…], trace_fragment }`. On a provider failure: `200` with
   `{ error:"provider_error", detail }` (the key is never echoed) so `hr-backend`
   escalates cleanly. **The key is used for this one call only — never persisted.**
+  In-text `[Fuente N]` markers are renumbered to the cited subset (1..M).
+- `POST /route` (**internal**, ADR-0016) — body `{ question, provider_api_key,
+  provider_config:{ provider, model, endpoint } }` with the **router** model.
+  Returns `{ label:"salary"|"prose"|"off_domain", confidence, subqueries:[…],
+  reason, trace_fragment }`. On a provider failure: `200` with
+  `{ error:"provider_error", detail }` so `hr-backend` fails safe to prose.
+- `POST /ground` (**internal**, the grounding gate) — body `{ question, answer,
+  chunks:[{ chunk_id, content, authority_level, is_tabular }], provider_api_key,
+  provider_config }` with the **answer** model. Returns `{ grounded,
+  claims:[{ claim, grounded, supporting_source }], ungrounded:[…],
+  trace_fragment }`. Table-aware per-claim entailment; on a provider failure:
+  `200` with `{ error:"provider_error", … }` so `hr-backend` escalates (not
+  grounded). **The key is used for this one call only — never persisted.**
 
 ## Sanity test (BGE-M3 / 1024 go-no-go)
 
