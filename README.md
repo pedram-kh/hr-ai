@@ -8,8 +8,9 @@ Python + FastAPI service for the HR platform's RAG and reasoning pipeline. See
 > salary `.xlsx`, and serves vector retrieval:
 > - `POST /embed` — re-extract a PDF **column-aware** (Euskara left / Spanish
 >   right via PyMuPDF block bboxes, after stripping page furniture), normalize
->   the BOG intra-word spacing artifact, **article-chunk**, embed with **BGE-M3
->   (1024-dim, self-hosted in-process, CPU)**, and **write `document_chunks`**.
+>   the BOG intra-word spacing artifact, **article-boundary chunk** (one chunk per
+>   article, ADR-0017), embed with **BGE-M3 (1024-dim, self-hosted in-process,
+>   CPU)**, and **write `document_chunks`**.
 > - `POST /extract-salary` — parse a salary `.xlsx` and **return** structured
 >   rows (extract-and-return; hr-ai writes no salary rows).
 > - `POST /retrieve` — scope-prefilter then **exact** similarity ranking
@@ -42,6 +43,22 @@ Python + FastAPI service for the HR platform's RAG and reasoning pipeline. See
 > Synthesis also now **renumbers the `[Fuente N]` markers** to the cited subset
 > (1..M) so they map 1:1 to the displayed sources. Salary-in-chat is SQL in
 > `hr-backend` (not here — ADR-0006).
+>
+> **Sprint 2c: article-boundary chunking (ADR-0017).** A **substrate** change in
+> `app/chunking/chunker.py` only — the answer loop is untouched. Each detected
+> article is now its **own chunk** and **cross-article packing is removed** (the
+> durable fix for the buried-grant artifact behind 2b-2 Correction-03). Only an
+> article over `chunk_token_cap` (**800** tok; preamble/fallback target **512**)
+> is sub-split on a sub-clause/paragraph/sentence boundary (never mid-sentence),
+> carrying its `Artículo N.º <título>` header onto each sub-chunk. The
+> now-load-bearing header detector runs with **three precision guards** —
+> **line-anchored, case-aware, monotonic-number** — so an inline `…del artículo
+> 22…` cannot spawn a chunk (variants: `Artículo N` · `Art. N.º` ·
+> `Artículo N.—/-` · Salamanca `ART N.-` · `N. artikulua` · `Disposición …` ·
+> defensive spelled-out). It **composes with — never replaces** — the 2a
+> extraction front-end (`extract_columns.py`: de-spacing, furniture stripping,
+> two-column positive-evidence detection, language gate, language tagging — all
+> unchanged). Re-chunk is the existing idempotent `chunks:embed`.
 
 ## Requirements
 

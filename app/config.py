@@ -40,10 +40,18 @@ class Settings(BaseSettings):
     embed_model_hf: str = "BAAI/bge-m3"
     embed_dim: int = 1024
 
-    # --- Chunking (Sprint 2a, ADR-0013) ---
-    # Article-aware chunking with a size cap; target ~400, hard cap ~512 tokens.
-    chunk_token_target: int = 400
-    chunk_token_cap: int = 512
+    # --- Chunking (Sprint 2a ADR-0013; Sprint 2c ADR-0017) ---
+    # ARTICLE-BOUNDARY chunking (Sprint 2c): one chunk per article, NO
+    # cross-article packing (the buried-grant fix). `target` governs the
+    # preamble / anchor-less paragraph fallback; `cap` is the size at which a
+    # single oversized article is sub-split on a sub-clause/paragraph boundary.
+    # Raised from 2a's 400/512 to keep a typical WHOLE article in one chunk
+    # (the §1.4/build-time BGE-M3 distribution shows the vast majority of
+    # articles fit under 512; only the disciplinary/classification/salud
+    # long-tail exceeds 800 and is sub-split). Locked after the real-tokenizer
+    # recompute — see sprint-02c-rechunk/review.md.
+    chunk_token_target: int = 512
+    chunk_token_cap: int = 800
     # De-spacing (geometry-first; tuned on the real Gipuzkoa file at the eyes-on
     # gate, plan §9 Q9): a glyph gap counts as a REAL space only when it exceeds
     # this fraction of the line's median glyph advance; smaller gaps are the
