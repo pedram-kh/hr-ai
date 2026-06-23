@@ -225,6 +225,20 @@ GROUND_SYSTEM_PROMPT = (
     "si no false>}"
 )
 
+# Output-token budget for the per-claim grounding JSON (Sprint 2b-2 Correction-04).
+# A rich multi-claim answer (e.g. a per-article vacaciones answer after the 2c
+# re-chunk) needs ~1,150 tokens of claim-by-claim JSON; the original 1024 cap
+# truncated the response (stop_reason="max_tokens"), `_extract_json` then failed,
+# and the conservative "unparseable → not grounded" branch escalated a
+# FULLY-grounded answer (the terse-vacaciones residual). 4096 gives comfortable
+# headroom (worst observed ground response ≈1,152 tok). On the rare residual
+# truncation we retry ONCE at a larger budget before escalating — and only with a
+# DISTINCT `grounding_truncated` trace note, never silently conflated with a
+# genuine ungrounded claim. This gives the gate room to finish; it never weakens
+# it (the "unparseable/truncated → escalate" floor stays).
+GROUND_MAX_TOKENS = 4096
+GROUND_MAX_TOKENS_RETRY = 8192
+
 
 def _build_ground_prompt(question: str, answer: str, chunks: list[GroundChunk]) -> str:
     lines = [f"Pregunta: {question}", "", f"Respuesta propuesta:\n{answer}", "", "FUENTES citadas:"]
@@ -433,14 +447,50 @@ class ClaudeProvider(AnswerProvider):
 
         client = anthropic.Anthropic(api_key=api_key, base_url=config.endpoint or None)
         user_prompt = _build_ground_prompt(question, answer, chunks)
+
+        # Call once at the (generous) budget. If the model still stops at the token
+        # cap (stop_reason == "max_tokens") the JSON is truncated — retry ONCE at a
+        # larger budget before giving up (Correction-04). A truncation is a budget
+        # problem, never evidence of a fabricated claim.
         started = time.monotonic()
         resp = client.messages.create(
             model=config.model,
-            max_tokens=1024,
+            max_tokens=GROUND_MAX_TOKENS,
             system=GROUND_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
         )
+        budget = GROUND_MAX_TOKENS
+        retried_on_truncation = False
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            retried_on_truncation = True
+            budget = GROUND_MAX_TOKENS_RETRY
+            resp = client.messages.create(
+                model=config.model,
+                max_tokens=GROUND_MAX_TOKENS_RETRY,
+                system=GROUND_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
         elapsed_ms = int((time.monotonic() - started) * 1000)
+
+        # Still truncated after the retry → a DISTINCT outcome, not a fabricated
+        # claim. hr-backend still escalates (the conservative floor is unchanged),
+        # but the trace says grounding_truncated so a truncation is never read as a
+        # genuine ungrounded claim.
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            return GroundingResult(
+                grounded=False,
+                claims=[],
+                ungrounded=["<grounding check truncated>"],
+                trace_fragment={
+                    "provider": config.provider,
+                    "model": config.model,
+                    "ground_ms": elapsed_ms,
+                    "grounding_truncated": True,
+                    "retried_on_truncation": retried_on_truncation,
+                    "max_tokens": budget,
+                },
+            )
+
         raw_text = "".join(
             block.text for block in resp.content if getattr(block, "type", None) == "text"
         )
@@ -452,7 +502,7 @@ class ClaudeProvider(AnswerProvider):
                 grounded=False,
                 claims=[],
                 ungrounded=["<grounding check unparseable>"],
-                trace_fragment={"provider": config.provider, "model": config.model, "ground_ms": elapsed_ms, "parse_error": True},
+                trace_fragment={"provider": config.provider, "model": config.model, "ground_ms": elapsed_ms, "parse_error": True, "retried_on_truncation": retried_on_truncation},
             )
 
         claims_in = envelope.get("claims") or []
@@ -501,5 +551,7 @@ class ClaudeProvider(AnswerProvider):
                 "claim_count": len(claims),
                 "substantive_count": substantive_count,
                 "provenance_count": provenance_count,
+                "max_tokens": budget,
+                "retried_on_truncation": retried_on_truncation,
             },
         )
