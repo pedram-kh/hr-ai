@@ -123,6 +123,43 @@ async def retrieve(
         await conn.close()
 
 
+async def retrieve_by_document(
+    query_vec: list[float],
+    document_id: int,
+    k: int,
+) -> list[dict]:
+    """Sandbox retrieval (Sprint 3): rank ONE document's chunks by similarity to
+    the query. Read-only, no scope filter beyond `document_id` — the Knowledge
+    Center "test a question against this document" panel scopes to a single doc.
+
+    This is ADDITIVE and DISTINCT from `retrieve()`: the employee answer loop
+    never passes a document_id and its primitive is untouched. Same exact (flat)
+    scan posture for determinism. hr-ai stays read-only (SELECT only here).
+    """
+    conn = await _connect()
+    try:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL enable_indexscan = off")
+            await conn.execute("SET LOCAL enable_bitmapscan = off")
+            rows = await conn.fetch(
+                """
+                SELECT id, document_id, chunk_index, page_from, page_to, content,
+                       retrieval_status, authority_level, convenio_id,
+                       (embedding <=> $1::vector) AS distance
+                FROM document_chunks
+                WHERE document_id = $2
+                ORDER BY embedding <=> $1::vector
+                LIMIT $3
+                """,
+                _vec_literal(query_vec),
+                document_id,
+                k,
+            )
+            return [dict(r) for r in rows]
+    finally:
+        await conn.close()
+
+
 async def count_eligible(
     convenio_id: int | None,
     include_national_law: bool,

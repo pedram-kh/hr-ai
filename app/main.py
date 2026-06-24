@@ -74,6 +74,16 @@ class RetrieveRequest(BaseModel):
     k: int = 8
 
 
+class SandboxRetrieveRequest(BaseModel):
+    """Single-document sandbox retrieval (Sprint 3). Read-only; ranks ONE
+    document's chunks by similarity. ADDITIVE — the employee /retrieve and the
+    whole answer loop are untouched (they never pass a document_id)."""
+
+    query: str
+    document_id: int
+    k: int = 8
+
+
 class SynthesisChunk(BaseModel):
     chunk_id: int
     document_id: int
@@ -239,6 +249,26 @@ async def retrieve_endpoint(req: RetrieveRequest) -> JSONResponse:
         for c in chunks:
             c["score"] = round(1.0 - float(c.pop("distance")), 6)
         return JSONResponse({"chunks": chunks, "eligible_total": eligible_total})
+    except Exception as exc:  # noqa: BLE001 - surface retrieval failure
+        return JSONResponse({"status": "error", "detail": str(exc)}, status_code=502)
+
+
+@app.post("/sandbox-retrieve", dependencies=[Depends(require_internal_token)])
+async def sandbox_retrieve(req: SandboxRetrieveRequest) -> JSONResponse:
+    """Sandbox retrieval over ONE document's chunks (Sprint 3 Knowledge Center).
+
+    Read-only and ADDITIVE: distinct from /retrieve so the employee answer loop's
+    scope-prefilter primitive is provably untouched. hr-ai writes nothing here.
+    """
+    from .chunks_db import retrieve_by_document
+    from .embeddings import embed_query
+
+    try:
+        qvec = embed_query(req.query)
+        chunks = await retrieve_by_document(qvec, req.document_id, req.k)
+        for c in chunks:
+            c["score"] = round(1.0 - float(c.pop("distance")), 6)
+        return JSONResponse({"chunks": chunks})
     except Exception as exc:  # noqa: BLE001 - surface retrieval failure
         return JSONResponse({"status": "error", "detail": str(exc)}, status_code=502)
 
