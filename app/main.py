@@ -137,6 +137,31 @@ class GroundRequest(BaseModel):
     provider_config: ProviderConfigBody
 
 
+class VocabularyCandidateBody(BaseModel):
+    id: int
+    name: str
+    aliases: list[str] = []
+    code: str | None = None
+
+
+class ProposeTagsRequest(BaseModel):
+    """Document-level facet tagging proposal (Sprint 7a, ADR-0011/0020).
+
+    hr-backend passes the document's already-extracted `page_text` (no re-read)
+    and the CLOSED candidate vocabulary so the model binds to real ids — it never
+    invents a value. hr-ai READS and PROPOSES; it writes NOTHING (ADR-0007). The
+    proposal is INERT: hr-backend persists it as `ai_agent` provenance and keeps
+    the document `under_review` (the embedding gate) until a human verifies.
+    Document-level facet tagging only — never multi-scope fact segmentation (7b).
+    """
+
+    document_id: int
+    page_text: str
+    candidate_vocabulary: dict[str, list[VocabularyCandidateBody]] = {}
+    provider_api_key: str
+    provider_config: ProviderConfigBody
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Liveness probe."""
@@ -388,6 +413,51 @@ def ground(req: GroundRequest) -> JSONResponse:
                 "grounded": result.grounded,
                 "claims": result.claims,
                 "ungrounded": result.ungrounded,
+                "trace_fragment": result.trace_fragment,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - never echo the body (it carries the key)
+        return JSONResponse({"error": "provider_error", "detail": str(exc)}, status_code=200)
+
+
+@app.post("/propose-tags", dependencies=[Depends(require_internal_token)])
+def propose_tags(req: ProposeTagsRequest) -> JSONResponse:
+    """Read a document's text and PROPOSE document-level facets + confidence,
+    bound to the CLOSED candidate vocabulary hr-backend passes (Sprint 7a,
+    ADR-0011/0020). hr-ai READS and PROPOSES — it writes NOTHING and never
+    migrates (ADR-0007). The proposal is INERT: hr-backend persists it as
+    `ai_agent` provenance and keeps the document `under_review` (the embedding
+    gate) until a human verifies. The AI never invents vocabulary (unresolvable
+    values become raw_unmatched_values) and does DOCUMENT-LEVEL facet tagging
+    only — never multi-scope fact segmentation (that is 7b).
+
+    On a provider failure this returns 200 with `{ "error": "provider_error" }`
+    (the key is never echoed) so hr-backend leaves the doc in the human queue —
+    a tagging failure never blocks ingest or surfaces an answerable doc.
+    """
+    from .providers import ProviderConfig, VocabularyCandidate, get_provider
+
+    try:
+        provider = get_provider(req.provider_config.provider)
+        config = ProviderConfig(
+            provider=req.provider_config.provider,
+            model=req.provider_config.model,
+            endpoint=req.provider_config.endpoint,
+        )
+        candidates = {
+            key: [
+                VocabularyCandidate(id=c.id, name=c.name, aliases=c.aliases, code=c.code)
+                for c in items
+            ]
+            for key, items in req.candidate_vocabulary.items()
+        }
+        result = provider.propose_tags(req.page_text, candidates, req.provider_api_key, config)
+        return JSONResponse(
+            {
+                "facets": result.facets,
+                "topics": result.topics,
+                "raw_unmatched_values": result.raw_unmatched_values,
+                "overall_confidence": result.overall_confidence,
                 "trace_fragment": result.trace_fragment,
             }
         )

@@ -28,6 +28,8 @@ from .base import (
     ProviderConfig,
     RouterResult,
     SynthesisResult,
+    TagProposalResult,
+    VocabularyCandidate,
 )
 
 # Authority ordering for the precedence rule. Lower index = higher precedence for
@@ -238,6 +240,91 @@ GROUND_SYSTEM_PROMPT = (
 # it (the "unparseable/truncated → escalate" floor stays).
 GROUND_MAX_TOKENS = 4096
 GROUND_MAX_TOKENS_RETRY = 8192
+
+
+# --- Tagging tier (Sprint 7a, ADR-0011/0020) — read content, PROPOSE facets ----
+# The AI is a STRICT, INERT proposer: it suggests document-level facets bound to
+# the CLOSED vocabulary hr-backend passes, and flags anything it cannot resolve
+# as a raw_unmatched_value (with an optional variant hint) — it NEVER invents a
+# vocabulary value, and it does DOCUMENT-LEVEL facet tagging only (never splits a
+# multi-scope file into per-scope facts — that is Sprint 7b).
+TAG_PROPOSAL_SYSTEM_PROMPT = (
+    "Eres un asistente de catalogación documental para una plataforma de RR. HH. "
+    "que gestiona convenios colectivos españoles. Recibes el TEXTO de UN documento "
+    "(que el parser de nombre de archivo no pudo clasificar) y unas LISTAS de "
+    "vocabulario CONTROLADO (convenios, territorios, sectores, tipos de documento). "
+    "Tu tarea: PROPONER las facetas de ESTE documento, cada una con su confianza.\n\n"
+    "REGLAS ABSOLUTAS:\n"
+    "1. SOLO PROPONES. No decides nada; un humano revisa y verifica tu propuesta. "
+    "Puedes equivocarte sin causar daño — tu salida es inerte hasta que un humano la "
+    "verifique.\n"
+    "2. VOCABULARIO CERRADO: para convenio, territorio, sector y tipo de documento, "
+    "devuelve EXCLUSIVAMENTE el `id` (o `code` para tipo de documento) de un valor de "
+    "las listas proporcionadas. JAMÁS inventes un valor nuevo ni devuelvas texto "
+    "libre. Si el documento parece referirse a un valor que NO está en las listas, "
+    "NO lo inventes: regístralo en `raw_unmatched_values` con el texto literal y, si "
+    "se parece a un valor existente, indícalo en `variant_of` (el id y por qué).\n"
+    "3. ÁMBITO POR DOCUMENTO: clasificas el documento COMPLETO con UN conjunto de "
+    "facetas. NO segmentes el documento en hechos por ámbito ni produzcas varias "
+    "filas de ámbito (eso es otra fase). Un documento → un conjunto de facetas.\n"
+    "4. El territorio y el sector se derivan del convenio: si propones un convenio, "
+    "propón su territorio/sector coherentes; si no hay convenio claro, puedes dejar "
+    "esas facetas sin proponer (confianza baja) en lugar de adivinar.\n"
+    "5. validity: propón el rango de vigencia como cadena \"AAAA-MM-DD..AAAA-MM-DD\" "
+    "solo si el texto lo enuncia con claridad; si no, omítela.\n"
+    "6. topics: propón SOLO ids de la lista de topics APROBADOS proporcionada (si la "
+    "hay); nunca inventes un topic.\n"
+    "7. Sé honesto con la confianza (0..1): baja cuando el texto es ambiguo o un escaneo "
+    "pobre. La confianza global es el MÍNIMO de las facetas.\n\n"
+    "FORMATO DE SALIDA: devuelve EXCLUSIVAMENTE un objeto JSON válido, sin texto "
+    "alrededor, con esta forma:\n"
+    '{"facets": [{"facet": "document_type", "value_code": "<code>", "confidence": <0..1>}, '
+    '{"facet": "convenio", "value_id": <id>, "confidence": <0..1>}, '
+    '{"facet": "territory", "value_id": <id>, "confidence": <0..1>}, '
+    '{"facet": "sector", "value_id": <id>, "confidence": <0..1>}, '
+    '{"facet": "validity", "value": "AAAA-MM-DD..AAAA-MM-DD", "confidence": <0..1>}], '
+    '"topics": [{"topic_id": <id>, "confidence": <0..1>}], '
+    '"raw_unmatched_values": [{"facet": "sector", "value": "<texto literal>", '
+    '"variant_of": {"id": <id>, "reason": "<por qué se parece>"}}]}'
+)
+
+# Cap the document text handed to the model so a 100-page scan can't blow the
+# prompt budget. The opening pages carry the title/scope signals the parser
+# needs; this is a proposal, not retrieval, so the head is sufficient.
+TAG_PROPOSAL_TEXT_CAP = 12000
+
+
+def _facet_candidate_block(label: str, items: list[VocabularyCandidate], with_code: bool = False) -> str:
+    lines = [f"{label}:"]
+    for c in items:
+        alias = f" (alias: {', '.join(c.aliases)})" if c.aliases else ""
+        ident = f"code={c.code}" if with_code and c.code is not None else f"id={c.id}"
+        lines.append(f"  - {ident} · {c.name}{alias}")
+    return "\n".join(lines)
+
+
+def _build_tag_prompt(page_text: str, candidate_vocabulary: dict[str, list[VocabularyCandidate]]) -> str:
+    text = (page_text or "").strip()
+    if len(text) > TAG_PROPOSAL_TEXT_CAP:
+        text = text[:TAG_PROPOSAL_TEXT_CAP] + "\n…[texto truncado]"
+    blocks = ["TEXTO DEL DOCUMENTO:", text, "", "VOCABULARIO CONTROLADO (usa solo estos ids/códigos):"]
+    if candidate_vocabulary.get("document_types"):
+        blocks.append(_facet_candidate_block("Tipos de documento", candidate_vocabulary["document_types"], with_code=True))
+    if candidate_vocabulary.get("territories"):
+        blocks.append(_facet_candidate_block("Territorios", candidate_vocabulary["territories"]))
+    if candidate_vocabulary.get("sectors"):
+        blocks.append(_facet_candidate_block("Sectores", candidate_vocabulary["sectors"]))
+    if candidate_vocabulary.get("convenios"):
+        blocks.append(_facet_candidate_block("Convenios (preseleccionados por indicios)", candidate_vocabulary["convenios"]))
+    if candidate_vocabulary.get("topics"):
+        blocks.append(_facet_candidate_block("Topics aprobados", candidate_vocabulary["topics"]))
+    blocks.append("")
+    blocks.append(
+        "Propón las facetas del documento vinculándolas SOLO a estos ids/códigos. "
+        "Lo que no resuelvas, regístralo en raw_unmatched_values (nunca inventes). "
+        "Devuelve solo el JSON."
+    )
+    return "\n".join(blocks)
 
 
 def _build_ground_prompt(question: str, answer: str, chunks: list[GroundChunk]) -> str:
@@ -553,5 +640,134 @@ class ClaudeProvider(AnswerProvider):
                 "provenance_count": provenance_count,
                 "max_tokens": budget,
                 "retried_on_truncation": retried_on_truncation,
+            },
+        )
+
+    def propose_tags(
+        self,
+        page_text: str,
+        candidate_vocabulary: dict[str, list[VocabularyCandidate]],
+        api_key: str,
+        config: ProviderConfig,
+    ) -> TagProposalResult:
+        """Read the document text and PROPOSE document-level facets bound to the
+        provided closed vocabulary (Sprint 7a). Strict, inert proposer — it
+        returns suggestions only; hr-backend persists them as `ai_agent`
+        provenance and keeps the doc `under_review` (the embedding gate). On a
+        parse failure it returns an empty proposal at confidence 0 so the doc
+        simply stays in the human queue (never a silent bad tag)."""
+        import anthropic  # lazy — dep only needed at call time
+
+        client = anthropic.Anthropic(api_key=api_key, base_url=config.endpoint or None)
+        user_prompt = _build_tag_prompt(page_text, candidate_vocabulary)
+
+        started = time.monotonic()
+        resp = client.messages.create(
+            model=config.model,
+            max_tokens=1024,
+            system=TAG_PROPOSAL_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        raw_text = "".join(
+            block.text for block in resp.content if getattr(block, "type", None) == "text"
+        )
+
+        try:
+            envelope = _extract_json(raw_text)
+        except (json.JSONDecodeError, ValueError):
+            return TagProposalResult(
+                facets=[],
+                topics=[],
+                raw_unmatched_values=[],
+                overall_confidence=0.0,
+                trace_fragment={
+                    "provider": config.provider,
+                    "model": config.model,
+                    "propose_ms": elapsed_ms,
+                    "parse_error": True,
+                },
+            )
+
+        # Validate the model's facet references against the provided candidate ids /
+        # codes so a hallucinated id can NEVER reach hr-backend. An out-of-set
+        # reference is dropped here (the closed-vocabulary guarantee, ADR-0002).
+        valid_ids: dict[str, set[int]] = {
+            "convenio": {c.id for c in candidate_vocabulary.get("convenios", [])},
+            "territory": {c.id for c in candidate_vocabulary.get("territories", [])},
+            "sector": {c.id for c in candidate_vocabulary.get("sectors", [])},
+        }
+        valid_doctype_codes = {c.code for c in candidate_vocabulary.get("document_types", []) if c.code}
+        valid_topic_ids = {c.id for c in candidate_vocabulary.get("topics", [])}
+
+        facets: list[dict] = []
+        confidences: list[float] = []
+        for f in envelope.get("facets") or []:
+            if not isinstance(f, dict):
+                continue
+            facet = str(f.get("facet", "")).strip()
+            try:
+                conf = float(f.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            if facet == "document_type":
+                code = f.get("value_code")
+                if code in valid_doctype_codes:
+                    facets.append({"facet": facet, "value_code": code, "confidence": conf})
+                    confidences.append(conf)
+            elif facet in ("convenio", "territory", "sector"):
+                vid = f.get("value_id")
+                if isinstance(vid, int) and vid in valid_ids[facet]:
+                    facets.append({"facet": facet, "value_id": vid, "confidence": conf})
+                    confidences.append(conf)
+            elif facet == "validity":
+                val = str(f.get("value", "")).strip()
+                if val:
+                    facets.append({"facet": facet, "value": val, "confidence": conf})
+                    confidences.append(conf)
+
+        topics: list[dict] = []
+        for t in envelope.get("topics") or []:
+            if not isinstance(t, dict):
+                continue
+            tid = t.get("topic_id")
+            if isinstance(tid, int) and tid in valid_topic_ids:
+                try:
+                    tconf = float(t.get("confidence", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    tconf = 0.0
+                topics.append({"topic_id": tid, "confidence": tconf})
+
+        raw_unmatched: list[dict] = []
+        for r in envelope.get("raw_unmatched_values") or []:
+            if not isinstance(r, dict):
+                continue
+            facet = str(r.get("facet", "")).strip()
+            value = str(r.get("value", "")).strip()
+            if not facet or not value:
+                continue
+            entry: dict = {"facet": facet, "value": value}
+            variant = r.get("variant_of")
+            # Keep a variant hint ONLY when it points at a real existing id.
+            if isinstance(variant, dict) and isinstance(variant.get("id"), int):
+                vfacet_ids = valid_ids.get(facet, set())
+                if variant["id"] in vfacet_ids:
+                    entry["variant_of"] = {"id": variant["id"], "reason": str(variant.get("reason", "")).strip()}
+            raw_unmatched.append(entry)
+
+        overall = round(min(confidences), 3) if confidences else 0.0
+
+        return TagProposalResult(
+            facets=facets,
+            topics=topics,
+            raw_unmatched_values=raw_unmatched,
+            overall_confidence=overall,
+            trace_fragment={
+                "provider": config.provider,
+                "model": config.model,
+                "propose_ms": elapsed_ms,
+                "prompt_tokens": getattr(resp.usage, "input_tokens", None),
+                "completion_tokens": getattr(resp.usage, "output_tokens", None),
+                "facet_count": len(facets),
             },
         )

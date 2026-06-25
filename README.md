@@ -59,6 +59,17 @@ Python + FastAPI service for the HR platform's RAG and reasoning pipeline. See
 > extraction front-end (`extract_columns.py`: de-spacing, furniture stripping,
 > two-column positive-evidence detection, language gate, language tagging — all
 > unchanged). Re-chunk is the existing idempotent `chunks:embed`.
+>
+> **Sprint 7a: the LLM tagging tier (ADR-0020).** Adds `POST /propose-tags` — read
+> a document's page text + the **closed candidate vocabulary** hr-backend passes
+> (full territory/sector/document_type lists + a convenio shortlist) and
+> **return** proposed facets + per-facet confidence + `raw_unmatched_values`
+> (variant hints). Same key-in-the-body, never-persisted, no-DB posture as
+> `/synthesise`·`/route`·`/ground`; **hr-ai writes nothing and never migrates**
+> (ADR-0007). It is a pure proposer — hr-backend persists the result as inert
+> `ai_agent` provenance (document stays `under_review`, FK scope columns
+> untouched). Document-level facet tagging only (multi-scope fact segmentation is
+> Sprint 7b).
 
 ## Requirements
 
@@ -135,6 +146,15 @@ uvicorn app.main:app --reload --port 8001
   trace_fragment }`. Table-aware per-claim entailment; on a provider failure:
   `200` with `{ error:"provider_error", … }` so `hr-backend` escalates (not
   grounded). **The key is used for this one call only — never persisted.**
+- `POST /propose-tags` (**internal**, ADR-0020) — body `{ document_id, page_text,
+  candidate_vocabulary:{ territory:[{id,name}], sector:[…], document_type:[…],
+  convenio:[…] }, provider_api_key, provider_config }` with the **answer** model.
+  Returns `{ facets:[{ facet, value_id, value, confidence }], topics:[…],
+  raw_unmatched_values:[{ facet, value, variant_of?, similarity? }],
+  overall_confidence, trace_fragment }` — the model binds to **real ids** from the
+  closed vocabulary (never free text); anything it cannot bind becomes a
+  `raw_unmatched_value`. hr-ai writes nothing; hr-backend persists it as an inert
+  proposal. **The key is used for this one call only — never persisted.**
 
 ## Sanity test (BGE-M3 / 1024 go-no-go)
 

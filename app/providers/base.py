@@ -93,6 +93,47 @@ class RouterResult:
 
 
 @dataclass
+class VocabularyCandidate:
+    """One closed-vocabulary value hr-backend passes to the tagging tier so the
+    model BINDS to a real id rather than inventing free text (Sprint 7a). The
+    full territory/sector/document_type lists are tiny + closed; convenios are a
+    parser-hint shortlist. `aliases` lets the model match a spelling variant."""
+
+    id: int
+    name: str
+    aliases: list[str] = field(default_factory=list)
+    code: str | None = None  # document_type code / territory code
+
+
+@dataclass
+class TagProposalResult:
+    """The document-level facet proposal for ONE document (Sprint 7a, ADR-0020).
+
+    The AI is a STRICT PROPOSER and is INERT: every value here is a SUGGESTION
+    that hr-backend persists as `ai_agent` provenance ONLY — it never writes the
+    authoritative scope FKs, and the document stays `under_review` (the embedding
+    gate keeps it unretrievable) until a human verifies. hr-ai writes NOTHING.
+
+    - `facets`: each {facet, value_id|value_code|value, confidence}. The model
+      resolves convenio/territory/sector/document_type to a candidate ID; it
+      records validity as a string. It BINDS into the provided vocabulary only.
+    - `topics`: existing APPROVED topic ids the document covers (never new ones).
+    - `raw_unmatched_values`: values it could not resolve, each with an optional
+      `variant_of` hint for the propose-new-vocabulary flow (it never invents).
+    - `overall_confidence`: the min across facets — drives the review queue order.
+
+    This is DOCUMENT-LEVEL facet tagging only — never multi-scope fact
+    segmentation (that is Sprint 7b). One document → one set of facets.
+    """
+
+    facets: list[dict] = field(default_factory=list)
+    topics: list[dict] = field(default_factory=list)
+    raw_unmatched_values: list[dict] = field(default_factory=list)
+    overall_confidence: float = 0.0
+    trace_fragment: dict = field(default_factory=dict)
+
+
+@dataclass
 class GroundingResult:
     """The per-claim entailment verdict for one prose answer (Sprint 2b-2, §5).
 
@@ -153,4 +194,20 @@ class AnswerProvider(ABC):
     ) -> GroundingResult:
         """Per-claim entailment of `answer` against the CITED `chunks`. The real
         grounding gate (Sprint 2b-2 §5). Table-aware. Capable answer model."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def propose_tags(
+        self,
+        page_text: str,
+        candidate_vocabulary: dict[str, list[VocabularyCandidate]],
+        api_key: str,
+        config: ProviderConfig,
+    ) -> TagProposalResult:
+        """Read a document's `page_text` and PROPOSE document-level facets +
+        confidence, binding into `candidate_vocabulary` ONLY (Sprint 7a). The AI
+        is a strict, inert proposer: it returns suggestions, never writes, never
+        invents vocabulary (unresolvable values become raw_unmatched_values with
+        an optional variant hint). Document-level facet tagging only — NOT
+        multi-scope fact segmentation (7b)."""
         raise NotImplementedError
