@@ -23,10 +23,12 @@ import time
 from .base import (
     AnswerProvider,
     ChunkInput,
+    ConvenioCandidate,
     GroundChunk,
     GroundingResult,
     ProviderConfig,
     RouterResult,
+    SegmentedFactsResult,
     SynthesisResult,
     TagProposalResult,
     VocabularyCandidate,
@@ -143,6 +145,53 @@ def _extract_json(text: str) -> dict:
     return json.loads(text)
 
 
+def _salvage_facts(text: str) -> dict:
+    """Recover complete fact objects from a `{"facts":[...]}` blob the model
+    truncated mid-array (stop_reason="max_tokens"). Scans the array brace-by-brace
+    (string-aware) and keeps only fully-closed objects; the trailing partial object
+    is discarded. Closed-set validation still applies downstream, so a salvaged
+    partial is strictly safer than the alternative (a parse failure → zero facts)."""
+    start = text.find('"facts"')
+    if start == -1:
+        return {"facts": []}
+    lb = text.find("[", start)
+    if lb == -1:
+        return {"facts": []}
+
+    facts: list = []
+    depth = 0
+    obj_start: int | None = None
+    in_str = False
+    esc = False
+    for i in range(lb + 1, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                obj_start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and obj_start is not None:
+                try:
+                    facts.append(json.loads(text[obj_start : i + 1]))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                obj_start = None
+        elif ch == "]" and depth == 0:
+            break
+    return {"facts": facts}
+
+
 def _renumber_markers(answer: str, orig_to_display: dict[int, int]) -> str:
     """Rewrite [Fuente N] markers from the model's input-chunk indices to the
     compact display numbers (1..M) of the cited subset (Sprint 2b-2 §7). A marker
@@ -241,6 +290,15 @@ GROUND_SYSTEM_PROMPT = (
 GROUND_MAX_TOKENS = 4096
 GROUND_MAX_TOKENS_RETRY = 8192
 
+# Output-token budget for the segmentation JSON (Sprint 7b-2). A multi-province
+# periodo file emits one verbose object per scope (value + raw_values + full
+# source_excerpt); a ~45-fact file (e.g. PERÍODOS 2026) needs ~16-18k tokens. The
+# original 8192 cap truncated that file mid-array (stop_reason="max_tokens"),
+# `_extract_json` failed, and the source produced ZERO facts. 32000 gives ample
+# headroom (well within Sonnet's output limit); `_salvage_facts` is the residual
+# safety net so a truncation degrades to "most facts" rather than "no facts".
+SEGMENT_MAX_TOKENS = 32000
+
 
 # --- Tagging tier (Sprint 7a, ADR-0011/0020) — read content, PROPOSE facets ----
 # The AI is a STRICT, INERT proposer: it suggests document-level facets bound to
@@ -323,6 +381,155 @@ def _build_tag_prompt(page_text: str, candidate_vocabulary: dict[str, list[Vocab
         "Propón las facetas del documento vinculándolas SOLO a estos ids/códigos. "
         "Lo que no resuelvas, regístralo en raw_unmatched_values (nunca inventes). "
         "Devuelve solo el JSON."
+    )
+    return "\n".join(blocks)
+
+
+# --- Segmentation agent (Sprint 7b-2, ADR-0022) — read a multi-scope reference
+# source, SEGMENT into per-scope facts, BIND each to a real convenio. The single
+# riskiest cognition in the project: a wrong scope is a confident, exact, wrong
+# answer. The load-bearing instruction is HEADER-CARRY (scope resets on each
+# TERRITORY/SECTOR header). The AI is a strict, inert proposer (ai_agent/
+# needs_review; never answerable, never salary, never new vocabulary).
+SEGMENT_FACTS_SYSTEM_PROMPT = (
+    "Eres un agente de segmentación documental para una plataforma de RR. HH. que "
+    "gestiona convenios colectivos españoles. Recibes el TEXTO COMPLETO de UN "
+    "documento de referencia (p. ej. una recopilación de periodos de prueba por "
+    "provincia y sector) y una lista de CONVENIOS de vocabulario CONTROLADO (cada "
+    "uno con su territorio y sector derivados, y sus categorías profesionales si "
+    "las hay). Tu tarea: PARTIR el documento en HECHOS individuales, uno por "
+    "ÁMBITO, y asignar a cada hecho su convenio.\n\n"
+    "REGLA MÁS IMPORTANTE — ARRASTRE DE ENCABEZADOS (header-carry):\n"
+    "El documento se organiza como ENCABEZADO DE TERRITORIO (una provincia o "
+    "ámbito: ESTATAL, ÁLAVA, NAVARRA, GIPUZKOA…), luego ENCABEZADO DE SECTOR (un "
+    "sector o un convenio nombrado: COEAS, Hostelería, Intervención Social, "
+    "Oficinas y Despachos…), y debajo las LÍNEAS DE VALOR (p. ej. 'Grupo 1: Cinco "
+    "meses'). El ámbito de CADA línea de valor es el TERRITORIO + SECTOR vigentes "
+    "MÁS RECIENTES. REINICIA el SECTOR en cada nuevo encabezado de sector, y "
+    "REINICIA territorio Y sector en cada nuevo encabezado de territorio. NUNCA "
+    "dejes que una línea herede la provincia del bloque anterior. Los encabezados "
+    "NO siempre tienen un estilo distinto: reconócelos por el CONTENIDO (un nombre "
+    "de provincia/ámbito = territorio; un nombre de sector o una línea corta que "
+    "introduce un bloque de 'Grupo …' = sector). DEDUCE la jerarquía del TEXTO.\n\n"
+    "REGLAS ABSOLUTAS:\n"
+    "1. SOLO PROPONES. No decides nada; un humano revisa y verifica. Tu salida es "
+    "INERTE hasta que un humano la verifique — puedes equivocarte sin causar daño, "
+    "salvo que des un ámbito equivocado con alta confianza (ese es el peor error). "
+    "Ante la duda del ámbito, BAJA la confianza y rellena `uncertainty`.\n"
+    "2. VOCABULARIO CERRADO: vincula cada hecho a un `convenio_id` de la lista. "
+    "JAMÁS inventes un convenio ni devuelvas texto libre como id. COEAS equivale a "
+    "'Ocio Educativo y Animación Sociocultural'. Resuelve variantes ortográficas "
+    "(Gipuzkoa/Guipúzcoa, Bizkaia/Vizcaya) por los alias. Si el (territorio, "
+    "sector) de un bloque NO coincide con ningún convenio de la lista (p. ej. "
+    "'ámbito estatal cuando no hay convenio territorial' o una regla general del "
+    "Estatuto de los Trabajadores), NO fuerces un convenio: omite el hecho o "
+    "emítelo con `uncertainty.field='scope'`. Mejor marcar incierto que adivinar.\n"
+    "3. UN HECHO POR ÁMBITO (valores múltiples): un bloque 'Grupo X' es UN hecho, "
+    "aunque su desglose por tipo de contrato ocupe varias líneas (p. ej. "
+    "'Indefinido: 90 días / Temporal +3m: 75 / Temporal −3m: 60'). Mete el "
+    "desglose COMPLETO en `value` y en `raw_values` — NO crees tres hechos. Un "
+    "rango de grupos ('Grupos 1 y 2', 'Grupos 3,4,5 y 6') es UN hecho para ese "
+    "rango. El ÁMBITO es la unidad consultable; el desglose vive dentro.\n"
+    "4. group_label OBLIGATORIO: devuelve SIEMPRE el grupo TAL CUAL aparece "
+    "('Grupo 1', 'Grupo 2 (resto áreas)', 'Grupo 1 y área cinco de Grupo 2', "
+    "'Obreros y subalternos'). Es el discriminador de identidad del hecho. Si una "
+    "categoría de la lista del convenio coincide claramente con el grupo, pon "
+    "también `job_category_id`; si no, déjalo null (lo normal) — el grupo va en "
+    "group_label.\n"
+    "5. EXPRESIONES DE GRUPO COMPUESTAS ('Grupo 1 y área cinco de Grupo 2') no "
+    "mapean a una sola categoría: deja `job_category_id` null y marca "
+    "`uncertainty.field='group'` con el motivo.\n"
+    "6. topic: vincula `topic_id` al topic 'periodo de prueba' de la lista si está "
+    "presente; si no, déjalo null. Nunca inventes un topic.\n"
+    "7. NADA DE SALARIOS: ignora por completo tablas de salarios, €/hora, SMI y "
+    "rejillas de retribución (van por otra vía). En una hoja de cálculo salarial, "
+    "los ÚNICOS hechos de referencia admisibles son jornada (horas/año, "
+    "horas/semana) o vigencia, y SOLO si puedes asignarlos con certeza a un "
+    "convenio. Si todo es salario, devuelve `facts` vacío — es lo correcto.\n"
+    "8. NO propongas vigencia ni fechas (las fija el sistema). NO propongas "
+    "autoridad.\n"
+    "9. TRAZABILIDAD OBLIGATORIA: cada hecho lleva `source_excerpt` = la(s) "
+    "línea(s) EXACTAS de origen con su rastro de encabezados (p. ej. 'ALAVA › "
+    "COEAS ALAVA › Grupo 1: Cinco meses') para que el revisor compruebe el ámbito "
+    "contra la cita. Usa los marcadores [loc:…] del texto para `source_locator`.\n"
+    "10. confianza (0..1): honesta. Baja cuando el ámbito es ambiguo. "
+    "`uncertainty` = {field, reason} cuando dudes (field ∈ scope|group|version|"
+    "value); null si estás seguro.\n"
+    "11. ÁMBITO ESTATAL SUPLETORIO / REGLA GENERAL → NO VINCULES, marca incierto. "
+    "Cuando un bloque se presenta como ámbito ESTATAL supletorio o como regla "
+    "general que aplica «cuando NO hay convenio territorial específico» (p. ej. "
+    "«ámbito estatal (cuando no hay convenio territorial específico)», «Estatuto de "
+    "los Trabajadores», «consideración general», o cualquier redacción que diga que "
+    "se aplica a falta de un acuerdo territorial), NO lo vincules a ningún "
+    "convenio, AUNQUE exista en la lista un convenio estatal real y del nivel "
+    "correcto. Emítelo con `uncertainty.field='scope'` y reason='statutory fallback "
+    "— no territorial convenio applies', dejando el ámbito SIN vincular, u "
+    "OMÍTELO. Vincular con confianza aquí es un error aunque el convenio elegido "
+    "sea real y del nivel correcto: es justo el caso que debe quedar para el "
+    "juicio humano.\n"
+    "12. CONTENIDO NO-PERIODO EN ESTA VÍA → NO EMITAS NADA. Si la fuente es una "
+    "hoja de salarios/jornada/horas (sus líneas son retribuciones, horas, días de "
+    "vacaciones, SMI… y NO reglas de periodo de prueba), NO emitas ningún hecho "
+    "salvo que una línea enuncie CLARAMENTE una regla de PERIODO DE PRUEBA. Las "
+    "cifras de jornada/horas/vacaciones NO son hechos de referencia en esta vía: "
+    "no vincules nada para ellas. (Es la contención de la regla 7: la invariante ya "
+    "bloquea las filas salariales; esto impide además disfrazar de hecho una línea "
+    "de jornada.)\n\n"
+    "FORMATO DE SALIDA: devuelve EXCLUSIVAMENTE un objeto JSON válido, sin texto "
+    "alrededor, con esta forma:\n"
+    '{"facts": [{"convenio_id": <id>, "job_category_id": <id|null>, '
+    '"group_label": "<grupo tal cual|null>", "topic_id": <id|null>, '
+    '"value": "<regla legible, con el desglose dentro>", '
+    '"raw_values": {<estructura literal opcional>}, "confidence": <0..1>, '
+    '"uncertainty": {"field": "scope|group|version|value", "reason": "<por qué>"}, '
+    '"source_locator": "<loc>", "source_excerpt": "<línea(s) exactas + rastro>"}]}'
+)
+
+# The reference fixtures are tiny (78/95 paragraphs); feed the FULL concatenated
+# text so header-carry sees the whole sequence (Q9 — never chunk). The cap only
+# guards against a huge salary xlsx (the routing test wants ~zero facts anyway).
+SEGMENT_TEXT_CAP = 48000
+
+
+def _convenio_candidate_block(convenios: list[ConvenioCandidate]) -> str:
+    lines = ["Convenios (vincula cada hecho a uno de estos id — territorio/sector se derivan):"]
+    for c in convenios:
+        alias = f" (alias: {', '.join(c.aliases)})" if c.aliases else ""
+        terr_alias = f" [{', '.join(c.territory_aliases)}]" if c.territory_aliases else ""
+        lines.append(
+            f"  - id={c.id} · {c.name}{alias} · territorio: {c.territory_name}{terr_alias}"
+            f" · sector: {c.sector_name}"
+        )
+        for jc in c.job_categories:
+            gc = f" ({jc.group_code})" if jc.group_code else ""
+            lines.append(f"      · categoría id={jc.id}: {jc.name}{gc}")
+    return "\n".join(lines)
+
+
+def _build_segment_prompt(
+    pages_text: str,
+    candidate_convenios: list[ConvenioCandidate],
+    candidate_topics: list[VocabularyCandidate],
+) -> str:
+    text = (pages_text or "").strip()
+    if len(text) > SEGMENT_TEXT_CAP:
+        text = text[:SEGMENT_TEXT_CAP] + "\n…[texto truncado]"
+    blocks = [
+        "TEXTO COMPLETO DEL DOCUMENTO DE REFERENCIA "
+        "(respeta el arrastre de encabezados territorio→sector→grupo):",
+        text,
+        "",
+        "VOCABULARIO CONTROLADO (usa solo estos ids):",
+        _convenio_candidate_block(candidate_convenios),
+    ]
+    if candidate_topics:
+        blocks.append(_facet_candidate_block("Topics aprobados", candidate_topics))
+    blocks.append("")
+    blocks.append(
+        "Segmenta el documento en hechos por ámbito, uno por (convenio + grupo), "
+        "vinculando cada uno a un convenio_id de la lista. Arrastra y REINICIA el "
+        "ámbito en cada encabezado. No inventes convenios; marca incierto lo que "
+        "no resuelvas. Ignora el salario. Devuelve solo el JSON."
     )
     return "\n".join(blocks)
 
@@ -769,5 +976,138 @@ class ClaudeProvider(AnswerProvider):
                 "prompt_tokens": getattr(resp.usage, "input_tokens", None),
                 "completion_tokens": getattr(resp.usage, "output_tokens", None),
                 "facet_count": len(facets),
+            },
+        )
+
+    def segment_facts(
+        self,
+        pages_text: str,
+        candidate_convenios: list[ConvenioCandidate],
+        candidate_topics: list[VocabularyCandidate],
+        api_key: str,
+        config: ProviderConfig,
+    ) -> SegmentedFactsResult:
+        """Segment a multi-scope reference source into per-scope facts bound to
+        the closed convenio vocabulary (Sprint 7b-2). Strict, inert proposer. On
+        a parse failure it returns an empty facts list so the source simply stays
+        unsegmented in the human queue (never a silent bad fact)."""
+        import anthropic  # lazy — dep only needed at call time
+
+        client = anthropic.Anthropic(api_key=api_key, base_url=config.endpoint or None)
+        user_prompt = _build_segment_prompt(pages_text, candidate_convenios, candidate_topics)
+
+        started = time.monotonic()
+        # A multi-province periodo file yields ~30-50 verbose facts of JSON; the
+        # large SEGMENT_MAX_TOKENS budget needed to avoid a mid-array truncation
+        # exceeds the SDK's non-streaming ceiling ("Streaming is required for
+        # operations that may take longer than 10 minutes"), so this call streams.
+        raw_text = ""
+        with client.messages.stream(
+            model=config.model,
+            max_tokens=SEGMENT_MAX_TOKENS,
+            system=SEGMENT_FACTS_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
+        ) as stream:
+            for chunk in stream.text_stream:
+                raw_text += chunk
+            resp = stream.get_final_message()
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        truncated = getattr(resp, "stop_reason", None) == "max_tokens"
+
+        salvaged = False
+        try:
+            envelope = _extract_json(raw_text)
+        except (json.JSONDecodeError, ValueError):
+            # A truncated array (or stray prose) fails strict parse — recover every
+            # complete object rather than dropping the whole source to zero facts.
+            envelope = _salvage_facts(raw_text)
+            salvaged = True
+            if not envelope.get("facts"):
+                return SegmentedFactsResult(
+                    facts=[],
+                    trace_fragment={
+                        "provider": config.provider,
+                        "model": config.model,
+                        "segment_ms": elapsed_ms,
+                        "parse_error": True,
+                    },
+                )
+
+        # Closed-set validation (ADR-0011 by construction): a hallucinated
+        # convenio/category/topic id can NEVER reach hr-backend. A category is
+        # valid ONLY for its own convenio (mirrors the hr-backend belongs-to
+        # check) — otherwise it is dropped to null, not silently mis-bound.
+        valid_convenio_ids = {c.id for c in candidate_convenios}
+        categories_by_convenio: dict[int, set[int]] = {
+            c.id: {jc.id for jc in c.job_categories} for c in candidate_convenios
+        }
+        valid_topic_ids = {c.id for c in candidate_topics}
+
+        facts: list[dict] = []
+        for f in envelope.get("facts") or []:
+            if not isinstance(f, dict):
+                continue
+            cid = f.get("convenio_id")
+            if not isinstance(cid, int) or cid not in valid_convenio_ids:
+                continue  # never accept an unbound/hallucinated scope
+            value = str(f.get("value", "")).strip()
+            if not value:
+                continue  # a fact must carry a rule
+
+            jcid = f.get("job_category_id")
+            if not (isinstance(jcid, int) and jcid in categories_by_convenio.get(cid, set())):
+                jcid = None  # drop a category that doesn't belong to this convenio
+
+            tid = f.get("topic_id")
+            if not (isinstance(tid, int) and tid in valid_topic_ids):
+                tid = None
+
+            try:
+                conf = float(f.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            conf = max(0.0, min(1.0, conf))
+
+            uncertainty = None
+            u = f.get("uncertainty")
+            if isinstance(u, dict) and (u.get("field") or u.get("reason")):
+                uncertainty = {
+                    "field": str(u.get("field", "")).strip() or "scope",
+                    "reason": str(u.get("reason", "")).strip(),
+                }
+
+            group_label = f.get("group_label")
+            group_label = str(group_label).strip() if group_label not in (None, "") else None
+
+            raw_values = f.get("raw_values")
+            if not isinstance(raw_values, dict):
+                raw_values = None
+
+            facts.append(
+                {
+                    "convenio_id": cid,
+                    "job_category_id": jcid,
+                    "group_label": group_label,
+                    "topic_id": tid,
+                    "value": value,
+                    "raw_values": raw_values,
+                    "confidence": round(conf, 3),
+                    "uncertainty": uncertainty,
+                    "source_locator": (str(f.get("source_locator", "")).strip() or None),
+                    "source_excerpt": str(f.get("source_excerpt", "")).strip(),
+                }
+            )
+
+        return SegmentedFactsResult(
+            facts=facts,
+            trace_fragment={
+                "provider": config.provider,
+                "model": config.model,
+                "segment_ms": elapsed_ms,
+                "prompt_tokens": getattr(resp.usage, "input_tokens", None),
+                "completion_tokens": getattr(resp.usage, "output_tokens", None),
+                "fact_count": len(facts),
+                "truncated": truncated,
+                "salvaged": salvaged,
             },
         )

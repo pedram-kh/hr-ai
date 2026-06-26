@@ -134,6 +134,65 @@ class TagProposalResult:
 
 
 @dataclass
+class JobCategoryCandidate:
+    """One convenio-scoped job category in the segmentation candidate vocabulary
+    (Sprint 7b-2). Sparse: `convenio_job_categories` is salary-derived, so many
+    periodo convenios have none — then the model leaves `job_category_id` null and
+    the group lives in `group_label`."""
+
+    id: int
+    name: str
+    group_code: str | None = None
+
+
+@dataclass
+class ConvenioCandidate:
+    """One convenio in the CLOSED candidate vocabulary for segmentation (Sprint
+    7b-2, ADR-0022). Convenio-centric: scope rides the convenio, so each carries
+    its DERIVED territory + sector (+ sparse job categories) inline. The model
+    picks a `convenio_id` whose (territory, sector) matches the carried
+    TERRITORY/SECTOR header — territory/sector are never returned (they derive).
+    `aliases` (incl. COEAS ≡ "Ocio Educativo y Animación Sociocultural", and the
+    territory spelling variants Gipuzkoa/Guipúzcoa, Bizkaia/Vizcaya) let the model
+    resolve the real-world naming variance in the fixtures."""
+
+    id: int
+    name: str
+    numero: str | None = None
+    aliases: list[str] = field(default_factory=list)
+    territory_name: str = ""
+    territory_aliases: list[str] = field(default_factory=list)
+    sector_name: str = ""
+    sector_aliases: list[str] = field(default_factory=list)
+    job_categories: list[JobCategoryCandidate] = field(default_factory=list)
+
+
+@dataclass
+class SegmentedFactsResult:
+    """The array of per-scope facts the segmentation agent proposes for ONE
+    reference_source (Sprint 7b-2, ADR-0022).
+
+    The AI is a STRICT, INERT proposer: every fact is a SUGGESTION hr-backend
+    persists as `ai_agent`/`needs_review` — not answerable, never verified by the
+    agent, never a salary row, never new vocabulary. hr-ai writes NOTHING.
+
+    Each fact dict carries: `convenio_id` (bound — territory/sector derive),
+    `job_category_id` (or null), `group_label` (the group AS WRITTEN — a
+    first-class identity discriminator so per-group facts don't collide on the
+    logical key), `topic_id` (or null), `value` + `raw_values` (the rule, multi-
+    value breakdown INSIDE — one fact per scope), `confidence`, `uncertainty`
+    ({field, reason} or null — flag-don't-guess), `source_locator` +
+    `source_excerpt` (the exact line + header trail, the review-UX defense).
+
+    The agent does NOT propose validity (hr-backend derives it from the source
+    document — Q7) and does NOT propose authority (hr-backend forces the floor).
+    """
+
+    facts: list[dict] = field(default_factory=list)
+    trace_fragment: dict = field(default_factory=dict)
+
+
+@dataclass
 class GroundingResult:
     """The per-claim entailment verdict for one prose answer (Sprint 2b-2, §5).
 
@@ -210,4 +269,25 @@ class AnswerProvider(ABC):
         invents vocabulary (unresolvable values become raw_unmatched_values with
         an optional variant hint). Document-level facet tagging only — NOT
         multi-scope fact segmentation (7b)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def segment_facts(
+        self,
+        pages_text: str,
+        candidate_convenios: list[ConvenioCandidate],
+        candidate_topics: list[VocabularyCandidate],
+        api_key: str,
+        config: ProviderConfig,
+    ) -> SegmentedFactsResult:
+        """Read a multi-scope reference_source's text and SEGMENT it into per-
+        scope facts (Sprint 7b-2, ADR-0022). THE load-bearing instruction is
+        header-carry: TERRITORY then SECTOR headers govern the value lines
+        beneath them until the next header; the scope RESETS on each new header.
+        The model re-derives the hierarchy FROM THE TEXT (the reader's section
+        split is unreliable) and BINDS each fact's `convenio_id` to the closed
+        candidate list (never invents). One fact per scope (multi-value breakdown
+        inside `value`/`raw_values`). A strict, inert proposer — it returns
+        suggestions, writes nothing, proposes no validity/authority, and flags
+        uncertainty rather than guessing scope."""
         raise NotImplementedError

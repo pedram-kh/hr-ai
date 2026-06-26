@@ -12,6 +12,11 @@ retrieval substrate:
                content-extraction utility (no scope, no segmentation — that is
                7b-2). hr-backend persists it as display `document_pages`, never
                `document_chunks` (queried-not-embedded, ADR-0006).
+- `/segment-facts` — Sprint 7b-2 (ADR-0022): read a multi-scope reference_source
+               and SEGMENT it into per-scope facts BOUND to the closed convenio
+               vocabulary (header-carry: scope resets on each TERRITORY/SECTOR
+               header). A strict, inert proposer — RETURNS facts, writes nothing;
+               hr-backend persists each as `ai_agent`/`needs_review` (ADR-0007).
 - `/retrieve` — scope-prefilter (WHERE) then EXACT similarity ranking; full
                recall (catch 2). No router (that is 2b-2).
 - `/synthesise` — Sprint 2b-1 (ADR-0015): compose a CITED answer grounded ONLY
@@ -175,6 +180,50 @@ class ProposeTagsRequest(BaseModel):
     document_id: int
     page_text: str
     candidate_vocabulary: dict[str, list[VocabularyCandidateBody]] = {}
+    provider_api_key: str
+    provider_config: ProviderConfigBody
+
+
+class JobCategoryCandidateBody(BaseModel):
+    id: int
+    name: str
+    group_code: str | None = None
+
+
+class ConvenioCandidateBody(BaseModel):
+    """One convenio in the segmentation candidate vocabulary (Sprint 7b-2).
+    Convenio-centric: scope rides the convenio, so each carries its derived
+    territory + sector (+ sparse job categories) so the model binds to a real id
+    whose (territory, sector) matches the carried header."""
+
+    id: int
+    name: str
+    numero: str | None = None
+    aliases: list[str] = []
+    territory_name: str = ""
+    territory_aliases: list[str] = []
+    sector_name: str = ""
+    sector_aliases: list[str] = []
+    job_categories: list[JobCategoryCandidateBody] = []
+
+
+class SegmentFactsRequest(BaseModel):
+    """Reference-source fact segmentation (Sprint 7b-2, ADR-0022).
+
+    hr-backend passes the FULL concatenated /read-structured content (Q9 — never
+    chunked, so header-carry sees the whole sequence) + the CLOSED candidate
+    convenios (convenio-centric) + the approved topics. hr-ai READS and SEGMENTS
+    into per-scope facts bound to real ids; it writes NOTHING (ADR-0007). The
+    proposal is INERT: hr-backend persists each fact as `ai_agent`/`needs_review`
+    (not answerable until a human verifies). No salary, no new vocabulary, no
+    validity/authority (hr-backend owns those)."""
+
+    document_id: int
+    document_uuid: str = ""
+    source_format: str = "docx"  # docx | xlsx — frames the prompt (prose vs grid)
+    pages_text: str
+    candidate_convenios: list[ConvenioCandidateBody] = []
+    candidate_topics: list[VocabularyCandidateBody] = []
     provider_api_key: str
     provider_config: ProviderConfigBody
 
@@ -499,3 +548,66 @@ def propose_tags(req: ProposeTagsRequest) -> JSONResponse:
         )
     except Exception as exc:  # noqa: BLE001 - never echo the body (it carries the key)
         return JSONResponse({"error": "provider_error", "detail": str(exc)}, status_code=200)
+
+
+@app.post("/segment-facts", dependencies=[Depends(require_internal_token)])
+def segment_facts(req: SegmentFactsRequest) -> JSONResponse:
+    """Read a multi-scope reference_source's text and SEGMENT it into per-scope
+    facts, each BOUND to a real convenio in the closed candidate list (Sprint
+    7b-2, ADR-0022). hr-ai READS and SEGMENTS — it writes NOTHING and never
+    migrates (ADR-0007). Each fact is INERT: hr-backend persists it as
+    `ai_agent`/`needs_review` (not answerable until a human verifies) and forces
+    the authority floor + the source validity. The AI never invents vocabulary
+    (closed-set id validation), never writes a salary row, and flags uncertainty
+    rather than guessing scope.
+
+    The load-bearing prompt detail is HEADER-CARRY: scope resets on each
+    TERRITORY/SECTOR header; the model re-derives the hierarchy from the text.
+
+    On a provider failure this returns 200 with `{ "facts": [], "error": ... }`
+    (the key is never echoed) so hr-backend leaves the source unsegmented in the
+    human queue — a segmentation failure never blocks ingest or surfaces an
+    answerable fact.
+    """
+    from .providers import (
+        ConvenioCandidate,
+        JobCategoryCandidate,
+        ProviderConfig,
+        VocabularyCandidate,
+        get_provider,
+    )
+
+    try:
+        provider = get_provider(req.provider_config.provider)
+        config = ProviderConfig(
+            provider=req.provider_config.provider,
+            model=req.provider_config.model,
+            endpoint=req.provider_config.endpoint,
+        )
+        convenios = [
+            ConvenioCandidate(
+                id=c.id,
+                name=c.name,
+                numero=c.numero,
+                aliases=c.aliases,
+                territory_name=c.territory_name,
+                territory_aliases=c.territory_aliases,
+                sector_name=c.sector_name,
+                sector_aliases=c.sector_aliases,
+                job_categories=[
+                    JobCategoryCandidate(id=jc.id, name=jc.name, group_code=jc.group_code)
+                    for jc in c.job_categories
+                ],
+            )
+            for c in req.candidate_convenios
+        ]
+        topics = [
+            VocabularyCandidate(id=t.id, name=t.name, aliases=t.aliases, code=t.code)
+            for t in req.candidate_topics
+        ]
+        result = provider.segment_facts(
+            req.pages_text, convenios, topics, req.provider_api_key, config
+        )
+        return JSONResponse({"facts": result.facts, "trace_fragment": result.trace_fragment})
+    except Exception as exc:  # noqa: BLE001 - never echo the body (it carries the key)
+        return JSONResponse({"facts": [], "error": "provider_error", "detail": str(exc)}, status_code=200)

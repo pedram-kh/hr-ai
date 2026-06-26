@@ -77,6 +77,23 @@ Python + FastAPI service for the HR platform's RAG and reasoning pipeline. See
 > extension to ADR-0010 (PDF-only). A content-extraction utility only — no scope,
 > no segmentation (that is 7b-2). hr-ai writes nothing, never migrates; hr-backend
 > stores it as display `document_pages`, never embedded.
+>
+> **Sprint 7b-2: the segmentation agent (ADR-0022).** Adds `POST /segment-facts` —
+> read a `reference_source`'s `document_pages` text + a **convenio-centric** closed
+> candidate vocabulary (each convenio carries its derived territory/sector/job
+> categories/aliases) + the approved topics, and **return** an array of per-scope
+> proposed facts, each with `convenio_id` (+ optional `job_category_id`/`topic_id`),
+> `value`/`raw_values`, `confidence`, structured `uncertainty`, and a mandatory
+> `source_excerpt`. The core cognition is the **header-carry contract** (each value
+> line inherits the most-recent TERRITORY+SECTOR, reset on each header — re-derived
+> from text, since the `/read-structured` section split is style-dependent and
+> unreliable across the fixtures). **Closed-set-validates every returned id**
+> (convenio / per-convenio job category / topic) before returning — a hallucinated
+> id can never reach hr-backend (ADR-0011). Same key-in-the-body, never-persisted,
+> writes-nothing, never-migrates posture; on provider/parse failure returns
+> `{ "facts": [], "error": "provider_error" }` (200) so the doc just stays
+> unsegmented in the human queue. hr-backend's `ReferenceFactProposalService`
+> persists the result as inert `ai_agent`/`needs_review` facts.
 
 ## Requirements
 
@@ -134,6 +151,17 @@ uvicorn app.main:app --reload --port 8001
   migrates (ADR-0007); hr-backend stores the content as display `document_pages`,
   **never** `document_chunks` (queried-not-embedded, ADR-0006). A salary `.xlsx`
   never reaches here — it is routed to `/extract-salary` by its document_type tag.
+- `POST /segment-facts` (**internal**, Sprint 7b-2, ADR-0022) — body
+  `{ document_id, document_uuid, source_format, pages:[…],
+  candidate_vocabulary:{ convenios:[{ id, numero, name, aliases, territory,
+  sector, job_categories }], topics:[{ id, name }] }, provider_api_key,
+  provider_config }`. Segments a `reference_source`'s text into **per-scope** facts
+  via the **header-carry contract** and binds each to a real `convenio_id`;
+  **returns** `{ facts:[{ convenio_id, job_category_id?, topic_id?, value,
+  raw_values, validity_start?, validity_end?, confidence, uncertainty?,
+  source_locator, source_excerpt }], trace_fragment }`. **Closed-set-validates
+  every id** before returning. Key-in-the-body, never-persisted, writes-nothing,
+  never-migrates; on failure → `{ facts: [], error: "provider_error" }` (200).
 - `POST /retrieve` (**internal**) — body `{ query, convenio_id?,
   include_national_law, retrieval_status[], as_of_date?, k }`. Embeds the query,
   scope-prefilters `document_chunks`, ranks by an **exact flat scan** (full
