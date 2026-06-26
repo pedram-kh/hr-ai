@@ -7,6 +7,11 @@ retrieval substrate:
                may write). hr-backend passes the resolved scope (ADR-0007/0013).
 - `/extract-salary` — parse a salary `.xlsx` and RETURN structured rows
                (extract-and-return; hr-backend writes the salary tables).
+- `/read-structured` — Sprint 7b-1 (ADR-0021): read a NON-salary `.docx`/`.xlsx`
+               and RETURN structured per-section/per-sheet content. A
+               content-extraction utility (no scope, no segmentation — that is
+               7b-2). hr-backend persists it as display `document_pages`, never
+               `document_chunks` (queried-not-embedded, ADR-0006).
 - `/retrieve` — scope-prefilter (WHERE) then EXACT similarity ranking; full
                recall (catch 2). No router (that is 2b-2).
 - `/synthesise` — Sprint 2b-1 (ADR-0015): compose a CITED answer grounded ONLY
@@ -63,6 +68,18 @@ class EmbedRequest(BaseModel):
 class SalaryExtractRequest(BaseModel):
     storage_key: str
     document_uuid: str
+
+
+class ReadStructuredRequest(BaseModel):
+    """Non-salary docx/xlsx content read (Sprint 7b-1, ADR-0021). Reads-and-
+    returns ONLY — never writes the DB, never migrates (ADR-0007). A
+    content-extraction utility: it does NOT decide scope or segment into facts
+    (that is 7b-2). `format` ∈ docx | xlsx; a salary xlsx never reaches here (it
+    is routed to /extract-salary by its document_type tag — Invariant 2)."""
+
+    storage_key: str
+    document_uuid: str
+    format: str  # "docx" | "xlsx"
 
 
 class RetrieveRequest(BaseModel):
@@ -246,6 +263,25 @@ def extract_salary(req: SalaryExtractRequest) -> JSONResponse:
         result = parse_salary_xlsx(xlsx_bytes)
         return JSONResponse(result)
     except Exception as exc:  # noqa: BLE001 - surface parse/storage failure
+        return JSONResponse({"status": "error", "detail": str(exc)}, status_code=502)
+
+
+@app.post("/read-structured", dependencies=[Depends(require_internal_token)])
+def read_structured_endpoint(req: ReadStructuredRequest) -> JSONResponse:
+    """Read a non-salary .docx/.xlsx → structured per-section/per-sheet content
+    (Sprint 7b-1, ADR-0021). hr-ai READS and RETURNS — it writes NO DB rows and
+    never migrates (ADR-0007). hr-backend persists the content as display
+    `document_pages` (never `document_chunks` — queried-not-embedded, ADR-0006)
+    and the human reads it to create reference facts by hand (7b-1). It does NOT
+    segment or assign scope (that is the 7b-2 AI). A salary .xlsx is never sent
+    here — it is routed to /extract-salary by its document_type tag (Invariant 2).
+    """
+    from .read_structured import read_structured
+
+    try:
+        result = read_structured(req.storage_key, req.document_uuid, req.format)
+        return JSONResponse(result)
+    except Exception as exc:  # noqa: BLE001 - surface read/storage failure
         return JSONResponse({"status": "error", "detail": str(exc)}, status_code=502)
 
 

@@ -70,6 +70,13 @@ Python + FastAPI service for the HR platform's RAG and reasoning pipeline. See
 > `ai_agent` provenance (document stays `under_review`, FK scope columns
 > untouched). Document-level facet tagging only (multi-scope fact segmentation is
 > Sprint 7b).
+>
+> **Sprint 7b-1: the docx/xlsx reader (ADR-0021).** Adds `POST /read-structured` —
+> read a **non-salary** `.docx` (python-docx) or `.xlsx` (openpyxl) and **return**
+> per-section/per-sheet content for the manual reference-fact path. The format
+> extension to ADR-0010 (PDF-only). A content-extraction utility only — no scope,
+> no segmentation (that is 7b-2). hr-ai writes nothing, never migrates; hr-backend
+> stores it as display `document_pages`, never embedded.
 
 ## Requirements
 
@@ -118,6 +125,15 @@ uvicorn app.main:app --reload --port 8001
   `{ tables:[{ sheet, year, rows:[{ job_category_name, group_code, gross_annual,
   base_salary_monthly, num_payments, hourly_rate, extra_pay, night_plus,
   raw_values }] }], warnings }`. hr-ai writes nothing; hr-backend writes the rows.
+- `POST /read-structured` (**internal**, Sprint 7b-1, ADR-0021) — body
+  `{ storage_key, document_uuid, format }` (`format` ∈ `docx` | `xlsx`). Reads a
+  **non-salary** `.docx` (python-docx) or `.xlsx` (openpyxl) and **returns**
+  `{ format, pages:[{ page_number, label, text, locator }] }` — one row per docx
+  section / xlsx sheet. A **content-extraction utility only**: it does NOT decide
+  scope or segment into facts (that is 7b-2). hr-ai writes nothing, never
+  migrates (ADR-0007); hr-backend stores the content as display `document_pages`,
+  **never** `document_chunks` (queried-not-embedded, ADR-0006). A salary `.xlsx`
+  never reaches here — it is routed to `/extract-salary` by its document_type tag.
 - `POST /retrieve` (**internal**) — body `{ query, convenio_id?,
   include_national_law, retrieval_status[], as_of_date?, k }`. Embeds the query,
   scope-prefilters `document_chunks`, ranks by an **exact flat scan** (full
