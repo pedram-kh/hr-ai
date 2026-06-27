@@ -169,23 +169,32 @@ uvicorn app.main:app --reload --port 8001
   `{ chunks:[{ …, score }], eligible_total }`.
 - `POST /synthesise` (**internal**, ADR-0015) — body `{ question,
   chunks:[{ chunk_id, document_id, page_from, page_to, content, score,
-  authority_level }], provider_api_key, provider_config:{ provider, model,
-  endpoint } }`. Composes a cited answer grounded only in `chunks`, applying the
-  convenio-over-baseline precedence rule. Returns `{ answer,
-  citations:[{ chunk_id, document_id, page_from, page_to, authority_level }],
-  grounding_signal:{ grounded, citation_count, top_chunk_score }, confidence,
-  authority_used:[…], trace_fragment }`. On a provider failure: `200` with
-  `{ error:"provider_error", detail }` (the key is never echoed) so `hr-backend`
-  escalates cleanly. **The key is used for this one call only — never persisted.**
-  In-text `[Fuente N]` markers are renumbered to the cited subset (1..M).
+  authority_level, source_type? }], provider_api_key, provider_config:{ provider,
+  model, endpoint } }`. Composes a cited answer grounded only in `chunks`, applying
+  the convenio-over-baseline precedence rule. Returns `{ answer,
+  citations:[{ chunk_id, document_id, page_from, page_to, authority_level,
+  source_type }], grounding_signal:{ grounded, citation_count, top_chunk_score },
+  confidence, authority_used:[…], trace_fragment }`. On a provider failure: `200`
+  with `{ error:"provider_error", detail }` (the key is never echoed) so
+  `hr-backend` escalates cleanly. **The key is used for this one call only — never
+  persisted.** In-text `[Fuente N]` markers are renumbered to the cited subset
+  (1..M). **7c composition (ADR-0023, additive):** `chunk_id` is now `int | None`
+  and each source carries `source_type` (default `"chunk"`); a `structured_reference`
+  reference fact is passed as one more typed source (`source_type:"reference_fact"`,
+  `chunk_id:null`) ranked **below** `official_convenio` and above `national_law`
+  (`_AUTHORITY_RANK`) — a fact never outranks a convenio. The citation dedup key is
+  null-safe (a fact keys on `(source_type, document_id)`). A prose-only turn sends no
+  fact source — the request is byte-for-byte identical to pre-7c.
 - `POST /route` (**internal**, ADR-0016) — body `{ question, provider_api_key,
   provider_config:{ provider, model, endpoint } }` with the **router** model.
   Returns `{ label:"salary"|"prose"|"off_domain", confidence, subqueries:[…],
   reason, trace_fragment }`. On a provider failure: `200` with
   `{ error:"provider_error", detail }` so `hr-backend` fails safe to prose.
 - `POST /ground` (**internal**, the grounding gate) — body `{ question, answer,
-  chunks:[{ chunk_id, content, authority_level, is_tabular }], provider_api_key,
-  provider_config }` with the **answer** model. Returns `{ grounded,
+  chunks:[{ chunk_id, content, authority_level, is_tabular, source_type? }],
+  provider_api_key, provider_config }` with the **answer** model. (`chunk_id` is
+  `int | None` and `source_type` defaults `"chunk"` — 7c, additive: a composed
+  answer's fact claim is entailed against the fact source, `chunk_id:null`.) Returns `{ grounded,
   claims:[{ claim, grounded, supporting_source }], ungrounded:[…],
   trace_fragment }`. Table-aware per-claim entailment; on a provider failure:
   `200` with `{ error:"provider_error", … }` so `hr-backend` escalates (not

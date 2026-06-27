@@ -22,15 +22,21 @@ class ChunkInput:
     convenio governs the topics it addresses; `national_law` (the Estatuto) is
     the baseline that applies only where the convenio is silent. hr-backend
     orders convenio chunks before national_law chunks before handing them here.
+
+    `source_type` (Sprint 7c Q7) discriminates a vector chunk from a structured
+    reference fact: a `reference_fact` source has chunk_id=None (it is not a
+    chunk, ADR-0006) and rides the SAME ordered source list + citation-mapping +
+    precedence as any chunk — it is just another typed, authority-labelled source.
     """
 
-    chunk_id: int
+    chunk_id: int | None
     document_id: int
     page_from: int | None
     page_to: int | None
     content: str
     score: float
     authority_level: str | None
+    source_type: str = "chunk"  # 'chunk' | 'reference_fact'
 
 
 @dataclass
@@ -70,10 +76,11 @@ class GroundChunk:
     chunk must not be ruled "grounded" just because the digits appear.
     """
 
-    chunk_id: int
-    content: str
+    chunk_id: int | None = None
+    content: str = ""
     authority_level: str | None = None
     is_tabular: bool = False
+    source_type: str = "chunk"  # 'chunk' | 'reference_fact' (Sprint 7c Q7)
 
 
 @dataclass

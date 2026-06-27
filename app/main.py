@@ -107,7 +107,13 @@ class SandboxRetrieveRequest(BaseModel):
 
 
 class SynthesisChunk(BaseModel):
-    chunk_id: int
+    # chunk_id is nullable + source_type discriminates the source kind (Sprint 7c
+    # Q7, ADR-0023): a vector chunk carries its chunk_id; a structured reference
+    # fact is `source_type="reference_fact"` with chunk_id=None (it is not a
+    # chunk — ADR-0006). Purely additive: a prose-only turn sends no fact source
+    # and every field defaults exactly as before (byte-for-byte identical request).
+    chunk_id: int | None = None
+    source_type: str = "chunk"  # 'chunk' | 'reference_fact'
     document_id: int
     page_from: int | None = None
     page_to: int | None = None
@@ -142,7 +148,11 @@ class RouteRequest(BaseModel):
 
 
 class GroundChunkBody(BaseModel):
-    chunk_id: int
+    # Nullable chunk_id + source_type (Sprint 7c Q7, ADR-0023) — a reference fact
+    # is entailed against its own quoted value with chunk_id=None. Additive: a
+    # prose-only /ground call is byte-for-byte identical to today.
+    chunk_id: int | None = None
+    source_type: str = "chunk"  # 'chunk' | 'reference_fact'
     content: str
     authority_level: str | None = None
     is_tabular: bool = False
@@ -402,6 +412,7 @@ def synthesise(req: SynthesiseRequest) -> JSONResponse:
         chunks = [
             ChunkInput(
                 chunk_id=c.chunk_id,
+                source_type=c.source_type,
                 document_id=c.document_id,
                 page_from=c.page_from,
                 page_to=c.page_to,
@@ -481,6 +492,7 @@ def ground(req: GroundRequest) -> JSONResponse:
         chunks = [
             GroundChunk(
                 chunk_id=c.chunk_id,
+                source_type=c.source_type,
                 content=c.content,
                 authority_level=c.authority_level,
                 is_tabular=c.is_tabular,

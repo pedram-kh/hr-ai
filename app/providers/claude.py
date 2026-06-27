@@ -40,7 +40,12 @@ from .base import (
 _AUTHORITY_RANK = {
     "internal_hr_ruling": 0,
     "official_convenio": 0,
-    "national_law": 1,
+    # A verified structured reference fact (Sprint 7c, ADR-0023) is convenio-derived
+    # structured knowledge: it ranks BELOW the convenio prose/ruling that governs
+    # the topic, and ABOVE the national_law (Estatuto) baseline. It can never
+    # outrank the convenio.
+    "structured_reference": 1,
+    "national_law": 2,
 }
 
 SYSTEM_PROMPT = (
@@ -108,6 +113,10 @@ def _authority_label(level: str | None) -> str:
         "national_law": "ley nacional / Estatuto (base mínima)",
         "official_convenio": "convenio (gobierna su materia)",
         "internal_hr_ruling": "resolución interna de RR. HH.",
+        # Sprint 7c (ADR-0023): a verified structured datum derived from the
+        # convenio — gobierna por debajo del texto del convenio, por encima del
+        # Estatuto. The convenio prose still governs on a same-point conflict.
+        "structured_reference": "dato de referencia estructurado del convenio (verificado)",
     }.get(level or "", "fuente")
 
 
@@ -608,7 +617,10 @@ class ClaudeProvider(AnswerProvider):
         citations: list[dict] = []
         authority_used: set[str] = set()
         orig_to_display: dict[int, int] = {}
-        chunkid_to_display: dict[int, int] = {}
+        # Dedup key is null-safe (Sprint 7c Q7): a reference_fact source has
+        # chunk_id=None, so it is keyed by its source_type+document_id instead of a
+        # (colliding) None. Vector chunks key by chunk_id exactly as before.
+        srckey_to_display: dict[object, int] = {}
         for n in cited_indices:
             try:
                 i = int(n)
@@ -617,15 +629,17 @@ class ClaudeProvider(AnswerProvider):
             if not (1 <= i <= len(chunks)):
                 continue
             c = chunks[i - 1]
-            if c.chunk_id in chunkid_to_display:
-                # A second model-index pointing at an already-cited chunk: reuse
+            src_key = c.chunk_id if c.chunk_id is not None else (getattr(c, "source_type", "chunk"), c.document_id)
+            if src_key in srckey_to_display:
+                # A second model-index pointing at an already-cited source: reuse
                 # its display number so the marker still resolves 1:1.
-                orig_to_display[i] = chunkid_to_display[c.chunk_id]
+                orig_to_display[i] = srckey_to_display[src_key]
                 continue
             display = len(citations) + 1
             citations.append(
                 {
                     "chunk_id": c.chunk_id,
+                    "source_type": getattr(c, "source_type", "chunk"),
                     "document_id": c.document_id,
                     "page_from": c.page_from,
                     "page_to": c.page_to,
@@ -633,7 +647,7 @@ class ClaudeProvider(AnswerProvider):
                 }
             )
             orig_to_display[i] = display
-            chunkid_to_display[c.chunk_id] = display
+            srckey_to_display[src_key] = display
             if c.authority_level:
                 authority_used.add(c.authority_level)
 
