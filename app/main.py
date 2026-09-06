@@ -29,7 +29,9 @@ retrieval substrate:
 hr-ai still NEVER migrates and writes NO table other than `document_chunks`.
 """
 
+import os
 from datetime import date
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -255,6 +257,37 @@ async def health_db() -> JSONResponse:
             {"status": "error", "connected": False, "detail": str(exc)},
             status_code=503,
         )
+
+
+@app.get("/health/model")
+async def health_model() -> JSONResponse:
+    """Model-presence gate (staging §3.2) — additive, does NOT modify `/health`.
+
+    `/health` stays a cheap, instant liveness probe. This endpoint checks
+    whether the BGE-M3 weights (~4.3 GB) are actually present on disk under
+    `$HF_HOME` (the sentence-transformers/huggingface_hub cache dir set via
+    the container's HF_HOME env var — see hr-ai/Dockerfile), rather than
+    just loaded-in-process. It does NOT trigger a load or a download itself.
+    Compose's healthcheck for the hr-ai service polls THIS endpoint (not
+    `/health`) so `docker compose ps` correctly shows `starting`/`unhealthy`
+    for the entire first-run download window instead of falsely `healthy`.
+    """
+    hf_home = os.environ.get("HF_HOME", "")
+    model_present = False
+    if hf_home:
+        # huggingface_hub's cache layout: <HF_HOME>/hub/models--<org>--<name>/
+        # snapshots/<revision>/*.safetensors
+        repo_dir = Path(hf_home) / "hub" / "models--BAAI--bge-m3"
+        if repo_dir.is_dir():
+            model_present = any(
+                f.stat().st_size > 0
+                for f in repo_dir.glob("snapshots/*/*.safetensors")
+            )
+    status_code = 200 if model_present else 503
+    return JSONResponse(
+        {"status": "ok" if model_present else "not_ready", "model_present": model_present},
+        status_code=status_code,
+    )
 
 
 @app.get("/health/config")

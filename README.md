@@ -103,6 +103,14 @@ Python + FastAPI service for the HR platform's RAG and reasoning pipeline. See
   (`:55432` Postgres, `:9900` MinIO).
 - Embeddings pull `sentence-transformers` + `torch` (CPU) and download the
   `BAAI/bge-m3` weights (~2.3 GB) on first use.
+- **S3 credentials (ADR-0009 — config only):** locally, `AWS_ACCESS_KEY_ID`/
+  `AWS_SECRET_ACCESS_KEY` are always set (MinIO's static `minioadmin`/
+  `minioadmin`). On staging/production, leave them **unset** — `app/storage.py`
+  then omits explicit credentials from the `boto3` client and falls back to
+  the default credential chain, which resolves the EC2 instance profile via
+  IMDS automatically (no long-lived key on the box — that's what the instance
+  profile exists to avoid). `AWS_ENDPOINT`/`AWS_REGION` are still set explicitly
+  either way (real S3's regional endpoint instead of MinIO's).
 
 ## Setup
 
