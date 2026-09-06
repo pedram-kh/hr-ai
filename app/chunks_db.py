@@ -160,6 +160,154 @@ async def retrieve_by_document(
         await conn.close()
 
 
+async def compare_scope(
+    probe_vecs: list[list[float]],
+    convenio_id: int | None,
+    authority_levels: list[str],
+    statuses: list[str],
+    as_of_date,
+    exclude_document_ids: list[int],
+    candidate_document_ids: list[int],
+    k: int,
+) -> list[list[dict]]:
+    """Sprint 7d (ADR-0024): rank a scope's chunks against N probe vectors.
+
+    READ-ONLY (SELECT only) and ADDITIVE — distinct from `retrieve()` so the
+    employee answer loop's primitive is provably untouched, and distinct from
+    `retrieve_by_document()` because the candidate set here is a SCOPE (a
+    convenio + an authority band), not one document.
+
+    THE LOAD-BEARING DIFFERENCE from `retrieve()`: `authority_level` is filtered
+    **in the SQL**, before the ORDER BY. That makes a threshold decision on the
+    top score **k-independent** — the best eligible chunk is rank 1 of an
+    exactly-filtered, exactly-ordered set, so no choice of `k` can hide it. The
+    publish fence is a safety gate; filtering authority client-side AFTER a
+    top-k would let unrelated same-convenio chunks (e.g. other published
+    rulings) crowd out the one overlapping official-convenio passage and make
+    the fence silently report "no conflict" — a fail-open. Hence this endpoint.
+
+    `candidate_document_ids` (when non-empty) pins the candidate set to an EXACT
+    list of documents — also in the SQL, preserving k-independence. hr-backend
+    uses it to make the candidate set exactly what the `documents` registry (the
+    system of record) says is eligible, because the denormalized scope columns on
+    `document_chunks` are only refreshed on re-embed and can be stale after a
+    lifecycle edit. `statuses = []` and `as_of_date = None` then mean "do not
+    filter on the chunk's (possibly stale) copy of the scope" — deliberate, not
+    an oversight.
+
+    `national_law` stays scope-global exactly as in `retrieve()` (the Estatuto
+    baseline is not convenio-scoped); it is only reachable when the caller asks
+    for it in `authority_levels`.
+
+    Returns one ranked list per probe, in probe order. Same forced flat scan for
+    exactness/determinism.
+    """
+    if not probe_vecs:
+        return []
+
+    conn = await _connect()
+    try:
+        async with conn.transaction():
+            # Force exact (flat) scan — identical posture to retrieve(): the
+            # scope+authority prefilter is applied exactly, and the top-k is exact.
+            await conn.execute("SET LOCAL enable_indexscan = off")
+            await conn.execute("SET LOCAL enable_bitmapscan = off")
+            results: list[list[dict]] = []
+            for vec in probe_vecs:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, document_id, chunk_index, page_from, page_to, content,
+                           retrieval_status, authority_level, convenio_id,
+                           (embedding <=> $1::vector) AS distance
+                    FROM document_chunks
+                    WHERE authority_level = ANY($2::varchar[])
+                      AND ( $3::bigint IS NULL
+                            OR convenio_id = $3
+                            OR authority_level = 'national_law' )
+                      AND (cardinality($4::varchar[]) = 0 OR retrieval_status = ANY($4::varchar[]))
+                      AND ($5::date IS NULL OR validity_start IS NULL OR validity_start <= $5::date)
+                      AND ($5::date IS NULL OR validity_end IS NULL OR validity_end >= $5::date)
+                      AND NOT (document_id = ANY($6::bigint[]))
+                      AND (cardinality($7::bigint[]) = 0 OR document_id = ANY($7::bigint[]))
+                    ORDER BY embedding <=> $1::vector
+                    LIMIT $8
+                    """,
+                    _vec_literal(vec),
+                    authority_levels,
+                    convenio_id,
+                    statuses,
+                    as_of_date,
+                    exclude_document_ids,
+                    candidate_document_ids,
+                    k,
+                )
+                results.append([dict(r) for r in rows])
+            return results
+    finally:
+        await conn.close()
+
+
+async def count_eligible_in_scope(
+    convenio_id: int | None,
+    authority_levels: list[str],
+    statuses: list[str],
+    as_of_date,
+    exclude_document_ids: list[int],
+    candidate_document_ids: list[int],
+) -> int:
+    """Exact count of the /compare-scope eligible set — the SAME WHERE as
+    `compare_scope` minus the vector. Lets hr-backend distinguish "compared
+    against N chunks and found nothing close" from "there was nothing to compare
+    against at all" (the second is not evidence of no conflict)."""
+    conn = await _connect()
+    try:
+        return await conn.fetchval(
+            """
+            SELECT count(*) FROM document_chunks
+            WHERE authority_level = ANY($1::varchar[])
+              AND ( $2::bigint IS NULL
+                    OR convenio_id = $2
+                    OR authority_level = 'national_law' )
+              AND (cardinality($3::varchar[]) = 0 OR retrieval_status = ANY($3::varchar[]))
+              AND ($4::date IS NULL OR validity_start IS NULL OR validity_start <= $4::date)
+              AND ($4::date IS NULL OR validity_end IS NULL OR validity_end >= $4::date)
+              AND NOT (document_id = ANY($5::bigint[]))
+              AND (cardinality($6::bigint[]) = 0 OR document_id = ANY($6::bigint[]))
+            """,
+            authority_levels,
+            convenio_id,
+            statuses,
+            as_of_date,
+            exclude_document_ids,
+            candidate_document_ids,
+        )
+    finally:
+        await conn.close()
+
+
+async def chunk_texts_for_document(document_id: int, limit: int) -> list[dict]:
+    """Sprint 7d: the probe side of a document↔document comparison (the §8.5
+    reverse re-check and the succession proposal use a document's own chunk
+    texts as probes). READ-ONLY; ordered by chunk_index so the probe order is
+    deterministic and reproducible in an audit."""
+    conn = await _connect()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT id, chunk_index, page_from, page_to, content
+            FROM document_chunks
+            WHERE document_id = $1
+            ORDER BY chunk_index
+            LIMIT $2
+            """,
+            document_id,
+            limit,
+        )
+        return [dict(r) for r in rows]
+    finally:
+        await conn.close()
+
+
 async def count_eligible(
     convenio_id: int | None,
     include_national_law: bool,

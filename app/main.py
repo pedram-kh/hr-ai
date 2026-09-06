@@ -19,6 +19,13 @@ retrieval substrate:
                hr-backend persists each as `ai_agent`/`needs_review` (ADR-0007).
 - `/retrieve` — scope-prefilter (WHERE) then EXACT similarity ranking; full
                recall (catch 2). No router (that is 2b-2).
+- `/compare-scope` — Sprint 7d (ADR-0024): the read-only semantic COMPARISON
+               primitive. Embeds N probe texts and ranks a scope's chunks
+               against each, with the `authority_level` band applied IN THE SQL
+               so a threshold decision on the top score is k-independent (the
+               publish fence is a safety gate; a post-top-k authority filter
+               could hide the one overlapping passage — a fail-open). No LLM,
+               no write, no migration.
 - `/synthesise` — Sprint 2b-1 (ADR-0015): compose a CITED answer grounded ONLY
                in the eligible chunks hr-backend passes, honouring the
                convenio-over-baseline precedence rule. The provider is pluggable
@@ -104,6 +111,42 @@ class SandboxRetrieveRequest(BaseModel):
     query: str
     document_id: int
     k: int = 8
+
+
+class CompareScopeRequest(BaseModel):
+    """Sprint 7d (ADR-0024) — the semantic COMPARISON primitive. Read-only.
+
+    Ranks a SCOPE's chunks (a convenio + an authority band) against N probe
+    texts. `texts` are embedded here with the same BGE-M3 model the corpus was
+    embedded with; nothing is written and nothing is persisted.
+
+    Why this exists instead of reusing /retrieve: /retrieve has no
+    `authority_level` filter, so the caller would have to filter AFTER the
+    top-k — and an overlapping official-convenio passage could be crowded out
+    of the top-k by other same-convenio chunks, making a SAFETY GATE report "no
+    conflict" when there is one. Here `authority_levels` is applied in the SQL
+    WHERE, so a threshold decision on `max_score` is k-independent.
+
+    `document_ids` (optional) overrides `texts`: the probes are read from those
+    documents' own chunk texts (the document↔document comparison used by the
+    §8.5 reverse re-check and the succession proposal), so hr-backend never has
+    to ship chunk text it already stored back over the wire.
+    """
+
+    texts: list[str] = []
+    document_ids: list[int] = []  # probe side: use these documents' chunk texts
+    probe_limit: int = 40  # cap on probes taken from document_ids
+    convenio_id: int | None = None
+    authority_levels: list[str] = ["official_convenio"]
+    # Candidate side. `candidate_document_ids` (non-empty) pins the candidates to an
+    # exact document list — hr-backend passes the `documents` registry's truth,
+    # because the chunk table's denormalized scope copy is only refreshed on
+    # re-embed. `retrieval_status: []` then means "don't filter on that stale copy".
+    candidate_document_ids: list[int] = []
+    retrieval_status: list[str] = ["active"]
+    as_of_date: date | None = None
+    exclude_document_ids: list[int] = []
+    k: int = 10
 
 
 class SynthesisChunk(BaseModel):
@@ -390,6 +433,90 @@ async def sandbox_retrieve(req: SandboxRetrieveRequest) -> JSONResponse:
             c["score"] = round(1.0 - float(c.pop("distance")), 6)
         return JSONResponse({"chunks": chunks})
     except Exception as exc:  # noqa: BLE001 - surface retrieval failure
+        return JSONResponse({"status": "error", "detail": str(exc)}, status_code=502)
+
+
+@app.post("/compare-scope", dependencies=[Depends(require_internal_token)])
+async def compare_scope_endpoint(req: CompareScopeRequest) -> JSONResponse:
+    """Sprint 7d (ADR-0024) — the read-only semantic COMPARISON primitive.
+
+    Embeds N probe texts and ranks the scope's chunks against each, with the
+    `authority_level` band applied IN THE SQL so the top score is k-independent
+    (see chunks_db.compare_scope). SELECT only: hr-ai writes nothing here and
+    still never migrates (ADR-0007). No LLM — this is embed-and-rank, the same
+    machinery the answer loop uses, pointed at a comparison job.
+
+    `max_score` is the single number a safety gate reads: the best similarity
+    any probe found against any eligible chunk. `eligible_total` is reported so
+    the caller can tell "nothing close" apart from "nothing to compare against".
+    """
+    from .chunks_db import chunk_texts_for_document, compare_scope, count_eligible_in_scope
+    from .embeddings import embed_texts
+
+    try:
+        # Probe side: explicit texts, or the chunk texts of the given documents.
+        probes: list[dict] = [{"text": t, "source": None} for t in req.texts if t and t.strip()]
+        for doc_id in req.document_ids:
+            for row in await chunk_texts_for_document(doc_id, req.probe_limit):
+                probes.append({
+                    "text": row["content"],
+                    "source": {
+                        "document_id": doc_id,
+                        "chunk_id": row["id"],
+                        "chunk_index": row["chunk_index"],
+                        "page_from": row["page_from"],
+                    },
+                })
+        probes = probes[: req.probe_limit]
+
+        if not probes:
+            return JSONResponse({
+                "matches": [], "max_score": None, "eligible_total": 0, "probe_count": 0,
+            })
+
+        vecs = embed_texts([p["text"] for p in probes])
+        ranked = await compare_scope(
+            vecs,
+            req.convenio_id,
+            req.authority_levels,
+            req.retrieval_status,
+            req.as_of_date,
+            req.exclude_document_ids,
+            req.candidate_document_ids,
+            req.k,
+        )
+        eligible_total = await count_eligible_in_scope(
+            req.convenio_id,
+            req.authority_levels,
+            req.retrieval_status,
+            req.as_of_date,
+            req.exclude_document_ids,
+            req.candidate_document_ids,
+        )
+
+        matches = []
+        max_score: float | None = None
+        for idx, (probe, chunks) in enumerate(zip(probes, ranked, strict=True)):
+            for c in chunks:
+                c["score"] = round(1.0 - float(c.pop("distance")), 6)
+                if max_score is None or c["score"] > max_score:
+                    max_score = c["score"]
+            matches.append({
+                "probe_index": idx,
+                "probe_source": probe["source"],
+                "probe_excerpt": probe["text"][:400],
+                "chunks": chunks,
+            })
+
+        return JSONResponse({
+            "matches": matches,
+            "max_score": max_score,
+            "eligible_total": eligible_total,
+            "probe_count": len(probes),
+        })
+    except Exception as exc:  # noqa: BLE001 - surface comparison failure to the caller
+        # A non-2xx is what makes hr-backend take its fail-toward-caution branch
+        # (never a silent "no conflict") — see SemanticFenceService.
         return JSONResponse({"status": "error", "detail": str(exc)}, status_code=502)
 
 

@@ -94,6 +94,18 @@ Python + FastAPI service for the HR platform's RAG and reasoning pipeline. See
 > `{ "facts": [], "error": "provider_error" }` (200) so the doc just stays
 > unsegmented in the human queue. hr-backend's `ReferenceFactProposalService`
 > persists the result as inert `ai_agent`/`needs_review` facts.
+>
+> **Sprint 7d: the comparison primitive (ADR-0024).** Adds `POST /compare-scope` —
+> **read-only and SELECT-only**: it embeds N probe texts with the same BGE-M3 model
+> the corpus uses and ranks a **scope's** chunks against each. No LLM, no write, no
+> migration. It exists rather than reusing `/retrieve` for one safety reason: the
+> **`authority_level` filter is applied in the SQL `WHERE`**, so the best eligible
+> `official_convenio` passage is rank 1 of an exactly-filtered, exactly-ordered set
+> and a threshold decision on `max_score` is **k-independent**. Filtering after a
+> top-k (which is all `/retrieve` allows) could let other same-convenio chunks crowd
+> out the overlapping passage — a **safety gate reporting "no conflict" when there
+> is one**. hr-backend uses it for the semantic publish fence, the §8.5 reverse
+> re-check and the succession proposal, and owns every resulting decision and write.
 
 ## Requirements
 
@@ -162,6 +174,22 @@ uvicorn app.main:app --reload --port 8001
   source_locator, source_excerpt }], trace_fragment }`. **Closed-set-validates
   every id** before returning. Key-in-the-body, never-persisted, writes-nothing,
   never-migrates; on failure → `{ facts: [], error: "provider_error" }` (200).
+- `POST /compare-scope` (**internal**, Sprint 7d, ADR-0024) — body
+  `{ texts[] | document_ids[], probe_limit, convenio_id?, authority_levels[],
+  candidate_document_ids[], retrieval_status[], as_of_date?, exclude_document_ids[],
+  k }`. Embeds N **probes** (either the supplied `texts`, or those documents' own
+  chunk texts) and ranks the scope's chunks against each; **returns**
+  `{ matches:[{ probe_index, probe_excerpt, probe_source?, chunks:[{ id,
+  document_id, chunk_index, page_from, content, authority_level, score }] }],
+  max_score, eligible_total, probe_count }`. **Read-only and SELECT-only** — no
+  LLM, no write, no migration. Two properties it exists for: `authority_levels` is
+  applied **in the SQL**, so a threshold decision on `max_score` is
+  **k-independent** (`k` controls only how many passages the human is shown, never
+  the decision); and `candidate_document_ids` pins the candidate set to hr-backend's
+  `documents`-registry truth, because `document_chunks` carries a denormalized scope
+  copy that is only refreshed on re-embed (`retrieval_status: []` then means "do not
+  filter on that stale copy"). Used by the semantic publish fence, the §8.5 reverse
+  re-check and the succession proposal — hr-backend decides and writes in all three.
 - `POST /retrieve` (**internal**) — body `{ query, convenio_id?,
   include_national_law, retrieval_status[], as_of_date?, k }`. Embeds the query,
   scope-prefilters `document_chunks`, ranks by an **exact flat scan** (full
