@@ -23,8 +23,19 @@ class Settings(BaseSettings):
 
     # --- Document extraction (Sprint 1, ADR-0010) ---
     aws_endpoint: str = "http://localhost:9000"
-    aws_access_key_id: str = "minioadmin"
-    aws_secret_access_key: str = "minioadmin"
+    # "" not "minioadmin": local dev's .env ALWAYS sets both explicitly (MinIO's
+    # static root user), so this default is never actually exercised there.
+    # Found live on staging: pydantic-settings falls back to this class default
+    # when the env var is absent (NOT to "" — that only happens if the var is
+    # explicitly set to an empty string), so the old "minioadmin" default made
+    # app/storage.py's `if settings.aws_access_key_id and ...:` fallback check
+    # always see two non-empty strings and pass them to boto3 as real (bogus)
+    # credentials — staging's deliberately-unset AWS_ACCESS_KEY_ID/SECRET
+    # (ADR-0009: instance-profile credential chain) never actually took effect,
+    # and every S3 call failed with InvalidAccessKeyId ("minioadmin" isn't a
+    # real AWS key). "" is falsy, so the fallback now works as designed.
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
     aws_region: str = "us-east-1"
     aws_bucket: str = "hr-documents"
     aws_use_path_style: bool = True

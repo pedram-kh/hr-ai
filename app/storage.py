@@ -16,14 +16,23 @@ _client = None
 def s3_client():
     global _client
     if _client is None:
-        _client = boto3.client(
-            "s3",
-            endpoint_url=settings.aws_endpoint,
-            aws_access_key_id=settings.aws_access_key_id,
-            aws_secret_access_key=settings.aws_secret_access_key,
-            region_name=settings.aws_region,
-            config=Config(s3={"addressing_style": "path" if settings.aws_use_path_style else "auto"}),
-        )
+        # Explicit static credentials for local dev (MinIO, always set). When
+        # unset (staging — no static key is issued, by design: a long-lived
+        # key is exactly what an EC2 instance profile exists to avoid), omit
+        # them so boto3 falls back to its default credential chain, which
+        # resolves the EC2 instance profile via IMDS automatically (ADR-0009 —
+        # config only, no adapter redesign). endpoint_url/region are unchanged
+        # either way: staging sets AWS_ENDPOINT to the real regional S3
+        # endpoint via config, same as it always pointed at MinIO in dev.
+        client_kwargs = {
+            "endpoint_url": settings.aws_endpoint,
+            "region_name": settings.aws_region,
+            "config": Config(s3={"addressing_style": "path" if settings.aws_use_path_style else "auto"}),
+        }
+        if settings.aws_access_key_id and settings.aws_secret_access_key:
+            client_kwargs["aws_access_key_id"] = settings.aws_access_key_id
+            client_kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
+        _client = boto3.client("s3", **client_kwargs)
     return _client
 
 

@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+!.env.example
+!.env.staging.example
+.venv
+__pycache__
+*.pyc
+_sanity.log
+scripts/__pycache__

@@ -29,6 +29,29 @@ import openpyxl
 
 _NUM_PAYMENTS = 14
 
+# Typed-column numeric bounds (must match hr-backend's salary_table_rows
+# migration precision — decimal(10,2) for the money columns, decimal(8,4) for
+# hourly_rate) — found live on staging (2026-09-06): a real spreadsheet
+# ("Tablas Intervencion Social Navarra", another "Tablas COEAS Navarra") has
+# a column genuinely header-labeled "€/hora" whose value is actually an
+# annual figure (13448.62 == 12 × the adjacent year's monthly figure) — a
+# data-entry error in the SOURCE spreadsheet, not a column-mapping bug here
+# (the header match is correct). Inserting it verbatim overflowed
+# hourly_rate's decimal(8,4) column and crashed the whole salary:import run
+# for every remaining document (ADR-0014's per-document isolation only
+# covers extractSalary() failures, not a DB-constraint violation inside the
+# write transaction). Rather than crash OR silently guess a "corrected"
+# value, an out-of-range typed value is dropped (kept in raw_values
+# verbatim, same as every other column) and reported in `warnings` — visible,
+# not guessed, per ADR-0014's whole design.
+_FIELD_BOUNDS = {
+    "gross_annual": 99_999_999.99,
+    "base_salary_monthly": 99_999_999.99,
+    "extra_pay": 99_999_999.99,
+    "hourly_rate": 9_999.9999,
+    "night_plus": 99_999_999.99,
+}
+
 
 def _norm(text) -> str:
     if text is None:
@@ -143,10 +166,11 @@ def _column_field_map(header: list[str]) -> dict:
     return mapping
 
 
-def _parse_sheet(name: str, rows: list[list]) -> dict | None:
+def _parse_sheet(name: str, rows: list[list]) -> tuple[dict | None, list[str]]:
+    warnings: list[str] = []
     header_idx = _find_header_row(rows)
     if header_idx is None:
-        return None
+        return None, warnings
     width = _width(rows)
     header = [_norm_or_index(rows[header_idx], i) for i in range(width)]
     field_map = _column_field_map(rows[header_idx])
@@ -210,7 +234,29 @@ def _parse_sheet(name: str, rows: list[list]) -> dict | None:
             elif field == "night_plus":
                 night = _to_float(val)
 
-        base_monthly = round(gross / _NUM_PAYMENTS, 2) if gross is not None else None
+        def _bounded(field: str, value, name_for_warning: str = job_category_name):
+            # Drop (never guess-correct) a typed value the DB column can't
+            # hold — the raw, verbatim figure stays in raw_values regardless
+            # (unconditional above), so nothing is lost, just not force-fit
+            # into a typed column it structurally cannot represent.
+            if value is None or abs(value) < _FIELD_BOUNDS[field]:
+                return value
+            warnings.append(
+                f"sheet '{name}': {field}={value!r} out of range for "
+                f"'{name_for_warning}' (source spreadsheet data-quality issue, not "
+                f"a mapping bug) — kept in raw_values only, not written as {field}"
+            )
+            return None
+
+        gross = _bounded("gross_annual", gross)
+        base_monthly = _bounded(
+            "base_salary_monthly",
+            round(gross / _NUM_PAYMENTS, 2) if gross is not None else None,
+        )
+        extra = _bounded("extra_pay", extra)
+        hourly = _bounded("hourly_rate", hourly)
+        night = _bounded("night_plus", night)
+
         out_rows.append(
             {
                 "job_category_name": job_category_name,
@@ -226,14 +272,14 @@ def _parse_sheet(name: str, rows: list[list]) -> dict | None:
         )
 
     if not out_rows:
-        return None
+        return None, warnings
     return {
         "sheet": name,
         "year": _year_from_sheet_name(name),
         "validity_start": None,
         "validity_end": None,
         "rows": out_rows,
-    }
+    }, warnings
 
 
 def _width(rows: list[list]) -> int:
@@ -258,7 +304,8 @@ def parse_salary_xlsx(xlsx_bytes: bytes) -> dict:
         if not rows or _width(rows) < 2:
             warnings.append(f"sheet '{name}' skipped (empty/too small)")
             continue
-        parsed = _parse_sheet(name, rows)
+        parsed, sheet_warnings = _parse_sheet(name, rows)
+        warnings.extend(sheet_warnings)
         if parsed is None:
             warnings.append(f"sheet '{name}' skipped (no salary-grid header found)")
             continue
