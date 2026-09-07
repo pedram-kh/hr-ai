@@ -200,6 +200,32 @@ class SegmentedFactsResult:
 
 
 @dataclass
+class OcrPageResult:
+    """One page's OCR transcription (Sprint 7e, ADR-0026) — the vision call's
+    return shape. hr-ai READS the page image and RETURNS this; it writes NOTHING
+    to the DB (the S3 sidecar write happens in `app/ocr.py`'s orchestration, not
+    here — this is the pure provider call, same separation as every other
+    capability: the provider never touches storage or the DB).
+
+    `columns`/`table_rows`/`article_headers` follow the PINNED table-placement
+    contract (Sprint 7e Round-2 Adjustment 2, review.md §1.6/§2.2): a table
+    page's title lives ONLY in `article_headers`; a footnote/plus-line block
+    lives ONLY in one `columns` `es` entry; `table_rows` holds ONLY the grid.
+    `bilingual` is derived the same way `extract_columns.py`'s native two-column
+    path derives it: a two-column layout where the two columns' `language`
+    differ. `trace_fragment` carries `cost_usd`/`sec_per_page`/`model` for the
+    caller to log and persist as `document_pages.ocr_cost_usd`/`ocr_engine`.
+    """
+
+    layout: str
+    columns: list[dict] = field(default_factory=list)
+    table_rows: list[list] = field(default_factory=list)
+    article_headers: list[str] = field(default_factory=list)
+    bilingual: bool = False
+    trace_fragment: dict = field(default_factory=dict)
+
+
+@dataclass
 class GroundingResult:
     """The per-claim entailment verdict for one prose answer (Sprint 2b-2, §5).
 
@@ -297,4 +323,19 @@ class AnswerProvider(ABC):
         inside `value`/`raw_values`). A strict, inert proposer — it returns
         suggestions, writes nothing, proposes no validity/authority, and flags
         uncertainty rather than guessing scope."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def ocr_page(
+        self,
+        image_bytes: bytes,
+        api_key: str,
+        config: ProviderConfig,
+    ) -> OcrPageResult:
+        """OCR one already-rendered page image (Sprint 7e, ADR-0026). Reads the
+        page and TRANSCRIBES it, literally — no cleanup/normalization, no
+        summarization, an illegible word becomes `[ilegible]` rather than a
+        guess. Binds to the pinned table-placement contract (see
+        `OcrPageResult`). `api_key` is a per-call argument, used for this one
+        page only, never persisted (same discipline as every other call)."""
         raise NotImplementedError

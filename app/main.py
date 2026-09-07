@@ -60,6 +60,10 @@ def require_internal_token(x_internal_token: str | None = Header(default=None)) 
 class ExtractRequest(BaseModel):
     storage_key: str
     document_uuid: str
+    # Sprint 7e (ADR-0026): opt-in OCR-fallback MARKER only (see extract.py's
+    # module docstring) — `/extract` never calls the vision model itself.
+    ocr: bool = False
+    ocr_page_cap: int = 60
 
 
 class Scope(BaseModel):
@@ -171,6 +175,21 @@ class ProviderConfigBody(BaseModel):
     provider: str = "claude"
     model: str
     endpoint: str | None = None
+
+
+class OcrPageRequest(BaseModel):
+    """OCR one already-rendered page image (Sprint 7e, ADR-0026, review.md
+    §2.1). Called once per page, either from hr-backend's queued `OcrPage` job
+    (ingest-time fallback) or its synchronous `documents:ocr-backfill` loop —
+    the same call either way. The decrypted key arrives in the body per call,
+    same discipline as `/synthesise`/`/propose-tags` (ADR-0015): never stored,
+    never logged, used for this one page only."""
+
+    document_uuid: str
+    page_number: int
+    image_key: str
+    provider_api_key: str
+    provider_config: ProviderConfigBody
 
 
 class SynthesiseRequest(BaseModel):
@@ -347,6 +366,11 @@ async def health_config() -> dict[str, object]:
         # The router (ADR-0016) — small/fast model, same key path. NON-SECRET.
         "router_model": settings.router_model,
         "router_endpoint": settings.router_endpoint or settings.answer_endpoint,
+        # OCR fallback (Sprint 7e, ADR-0026) — its own model, deliberately never
+        # aliased to answer_model. NON-SECRET; hr-backend passes the actual
+        # provider_config used per /ocr-page call, so this is a visibility
+        # default only (matching answer_model/router_model's own role here).
+        "ocr_model": settings.ocr_model,
     }
 
 
@@ -358,13 +382,42 @@ def extract(req: ExtractRequest) -> JSONResponse:
     Never writes the database.
     """
     try:
-        result = extract_pdf(req.storage_key, req.document_uuid)
+        result = extract_pdf(req.storage_key, req.document_uuid, req.ocr, req.ocr_page_cap)
         return JSONResponse(result)
     except Exception as exc:  # noqa: BLE001 - surface extraction/storage failure
         return JSONResponse(
             {"status": "error", "detail": str(exc)},
             status_code=502,
         )
+
+
+@app.post("/ocr-page", dependencies=[Depends(require_internal_token)])
+def ocr_page_endpoint(req: OcrPageRequest) -> JSONResponse:
+    """OCR one already-rendered page image (Sprint 7e, ADR-0026). Reuses the
+    image `/extract` already rendered — never re-renders. Writes the S3 sidecar
+    (`documents/{uuid}/ocr/{page:04d}.json`) that `extract_language_streams`
+    later probes for at `/embed` time (Option B, review.md §2.3); returns the
+    flattened page text hr-backend writes to `document_pages.text` unchanged
+    through the existing write path. hr-ai writes NO database row here — only
+    the sidecar, within its existing S3-write privilege (ADR-0010).
+
+    On a provider/parse failure returns 200 with `{ "error": "provider_error" }`
+    (the key is never echoed) so hr-backend leaves the page `ocr_pending` for a
+    retry — never a guess at page content, and never fails the caller's request.
+    """
+    from .ocr import ocr_page
+    from .providers import ProviderConfig
+
+    try:
+        config = ProviderConfig(
+            provider=req.provider_config.provider,
+            model=req.provider_config.model,
+            endpoint=req.provider_config.endpoint,
+        )
+        result = ocr_page(req.document_uuid, req.page_number, req.image_key, req.provider_api_key, config)
+        return JSONResponse(result, status_code=200)
+    except Exception as exc:  # noqa: BLE001 - never echo the body (it carries the key)
+        return JSONResponse({"error": "provider_error", "detail": str(exc)}, status_code=200)
 
 
 @app.post("/embed", dependencies=[Depends(require_internal_token)])
@@ -379,7 +432,7 @@ async def embed(req: EmbedRequest) -> JSONResponse:
         scope = req.scope.model_dump()
         scope["validity_start"] = req.scope.validity_start
         scope["validity_end"] = req.scope.validity_end
-        result = await embed_document(req.document_id, req.storage_key, scope)
+        result = await embed_document(req.document_id, req.document_uuid, req.storage_key, scope)
         return JSONResponse(result)
     except Exception as exc:  # noqa: BLE001 - surface embed/storage/db failure
         return JSONResponse({"status": "error", "detail": str(exc)}, status_code=502)
