@@ -5,3 +5,11 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 *.egg-info/
+
+# Guard against ~/.gitignore_global's `_*` pattern silently untracking
+# __init__.py forever (found live, Sprint 7e: app/providers/__init__.py was
+# never committed, in any branch, ever — every provider-backed endpoint
+# (/route, /ground, /synthesise, /propose-tags, /segment-facts, /ocr-page)
+# ImportErrors on a truly fresh `git clone` + Docker build, because Python
+# then treats `app.providers` as a namespace package with no re-exports).
+!**/__init__.py
