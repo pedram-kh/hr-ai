@@ -114,6 +114,24 @@ row = result["tables"][0]["rows"][0]
 check("monthly is the base column", row["base_salary_monthly"], 1900.00)
 check("pagas_count is not guessed between 14 and 12", row["pagas_count"], None)
 
+print("5b. the monthly figure carries the header it was read from, verbatim")
+result = parse_salary_xlsx(workbook({"2025": [
+    ["CATEGORÍA", "Salario Base", "Bruto mes", "Bruto anual"],
+    ["Grupo 3", 1183.34, 1771.64, 21259.75],
+]}))
+row = result["tables"][0]["rows"][0]
+check("the label keeps the source's own casing", row["base_salary_monthly_label"], "Salario Base")
+check("the typed figure is the base, not the bruto", row["base_salary_monthly"], 1183.34)
+check("and the other monthly stays verbatim in raw_values", row["raw_values"]["bruto mes"], 1771.64)
+
+print("5c. a monthly read from an 'N pagas' column is labelled as that column")
+result = parse_salary_xlsx(workbook({"2026": [
+    ["Grupo", "14 pagas", "12 pagas", "Hora"],
+    ["Director/a", 2231.04, 2602.88, 18.33],
+]}))
+row = result["tables"][0]["rows"][0]
+check("labelled '14 pagas', never 'salario base'", row["base_salary_monthly_label"], "14 pagas")
+
 print("6. a multi-year block repeating a header keeps BOTH figures and types neither")
 result = parse_salary_xlsx(workbook({"2024-2025": [
     ["Grupo", "2025", "14 pagas", "12 pagas", "2026", "14 pagas", "12 pagas"],

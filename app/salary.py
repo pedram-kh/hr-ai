@@ -22,7 +22,12 @@ own gazette contradicts (convenio 15, Gestores Información Gipuzkoa: gazette
 
 - `base_salary_monthly` is set ONLY from a column the source itself labels as a
   monthly base (`SB`, `Salario base`, `Salario base (mes)`, `14 pagas`…), never
-  computed from the annual;
+  computed from the annual, and it travels with
+  `base_salary_monthly_label` — the source header VERBATIM, so the answer can
+  name the figure the way the table names it ("salario base mensual" vs
+  "importe mensual en 14 pagas") instead of a generic "salario mensual" that
+  would blur two different quantities (convenio 10 prints both a `salario base`
+  of 1.183,34 and a `bruto mes` of 1.771,64);
 - `pagas_count` is a typed field of its own, set ONLY when a header states it
   ("14 pagas", "Bruto/mes 12 pagas"), and is NEVER used to derive anything;
 - when the source states no monthly, `base_salary_monthly` stays NULL and the
@@ -181,7 +186,8 @@ def _find_header_row(rows: list[list]) -> int | None:
             label = _norm(cell)
             if not label:
                 continue
-            if label in _HEADER_MARKERS or _looks_like_hours_header(label) or label in _GROSS:
+            if (label in _HEADER_MARKERS or _looks_like_hours_header(label)
+                    or _MONTHLY_AT_PAGAS_RE.match(label)):
                 score += 1
         if score > best_score:
             best_idx, best_score = i, score
@@ -310,6 +316,7 @@ def _parse_sheet(name: str, rows: list[list]) -> tuple[dict | None, list[str], d
     header = [_norm_or_index(rows[header_idx], i) for i in range(width)]
     field_map = _column_field_map(rows[header_idx])
     monthly_idx, pagas_count, monthly_warnings = _monthly_column(rows[header_idx])
+    monthly_label = _verbatim(rows[header_idx], monthly_idx)
     warnings.extend(f"sheet '{name}': {w}" for w in monthly_warnings)
     diagnostic["typed_fields"] = sorted(set(field_map.values()))
     if not field_map:
@@ -327,7 +334,16 @@ def _parse_sheet(name: str, rows: list[list]) -> tuple[dict | None, list[str], d
     # Label columns = everything LEFT of the first money-header column (the
     # numeric grid). Robust across formats whose label is a code that *looks*
     # numeric (Cantabria "3.1") — header position, not value type, decides.
-    money_cols = [c for c in range(width) if header[c] in _MONEY_HEADERS or _looks_like_hours_header(header[c])]
+    # A column that was TYPED is part of the numeric grid by definition — without
+    # `c in field_map` a sheet whose only money headers are "14 pagas"/"12 pagas"
+    # (they are matched by pattern, not by the literal synonym set) puts the grid
+    # boundary past them, and the monthly figures end up read as the category's
+    # NAME ("Director/a | 2231,04 | 2602,88" → category "2602.88").
+    money_cols = [
+        c for c in range(width)
+        if header[c] in _MONEY_HEADERS or _looks_like_hours_header(header[c])
+        or _MONTHLY_AT_PAGAS_RE.match(header[c]) or c in field_map
+    ]
     if money_cols:
         first_money = min(money_cols)
     else:
@@ -421,6 +437,9 @@ def _parse_sheet(name: str, rows: list[list]) -> tuple[dict | None, list[str], d
                 "group_code": group_code,
                 "gross_annual": round(gross, 2) if gross is not None else None,
                 "base_salary_monthly": round(base_monthly, 2) if base_monthly is not None else None,
+                # The header the monthly figure was read from, verbatim — the
+                # answer names the figure with the table's own wording.
+                "base_salary_monthly_label": monthly_label if base_monthly is not None else None,
                 "extra_pay": round(extra, 2) if extra is not None else None,
                 # A typed field in its own right, stated by the source or NULL.
                 # NEVER used to derive another figure.
@@ -454,6 +473,16 @@ def _width(rows: list[list]) -> int:
 
 def _norm_or_index(row: list, i: int) -> str:
     return _norm(row[i]) if i < len(row) else ""
+
+
+def _verbatim(row: list, i: int | None) -> str | None:
+    """A header cell exactly as the source writes it — only whitespace collapsed
+    (a gazette header is often typeset across two lines). Case, accents,
+    punctuation and units are kept: this string is quoted back to the employee."""
+    if i is None or i >= len(row) or row[i] is None:
+        return None
+    text = re.sub(r"\s+", " ", str(row[i])).strip()
+    return text or None
 
 
 def parse_salary_xlsx(xlsx_bytes: bytes) -> dict:
