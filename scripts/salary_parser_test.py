@@ -114,7 +114,18 @@ row = result["tables"][0]["rows"][0]
 check("monthly is the base column", row["base_salary_monthly"], 1900.00)
 check("pagas_count is not guessed between 14 and 12", row["pagas_count"], None)
 
-print("6. sheet_diagnostics separate a notes sheet from an empty recognized grid")
+print("6. a multi-year block repeating a header keeps BOTH figures and types neither")
+result = parse_salary_xlsx(workbook({"2024-2025": [
+    ["Grupo", "2025", "14 pagas", "12 pagas", "2026", "14 pagas", "12 pagas"],
+    ["Director", 30324.80, 2166.06, 2527.07, 31234.54, 2231.04, 2602.88],
+]}))
+row = result["tables"][0]["rows"][0]
+check("no monthly is filed under the wrong year", row["base_salary_monthly"], None)
+check("nor a pagas count", row["pagas_count"], None)
+check("the first 14-pagas figure survives", row["raw_values"]["14 pagas"], 2166.06)
+check("and so does the second, suffixed", row["raw_values"]["14 pagas (2)"], 2231.04)
+
+print("7. sheet_diagnostics separate a notes sheet from an empty recognized grid")
 result = parse_salary_xlsx(workbook({
     "2026": [["Categoría", "Salario anual"], ["Grupo I", 33491.36]],
     "Notes": [["page", "note"], ["1", "publicado en el BOG"]],

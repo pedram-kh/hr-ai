@@ -243,6 +243,19 @@ def _monthly_column(header: list[str]) -> tuple[int | None, int | None, list[str
     warnings: list[str] = []
     chosen = candidates[0]
     if len(candidates) > 1:
+        # The SAME stated count appearing twice means the sheet is a multi-year
+        # block (COEAS Navarra prints 2025's "14 pagas" and 2026's side by
+        # side). Which year each column belongs to is not something the header
+        # row settles, and this table carries exactly one year — so no monthly
+        # is typed at all rather than filing one year's figure under another's.
+        counts = [c[1] for c in candidates if c[1] is not None]
+        if counts and len(counts) != len(set(counts)):
+            return None, None, [
+                f"the same pagas count is stated by more than one column ({sorted(counts)}) — this is a "
+                "multi-year block, so which year each monthly belongs to is unsettled: base_salary_monthly "
+                "left NULL (every figure stays verbatim in raw_values)"
+            ]
+
         preferred = next((c for c in candidates if c[1] == 14), None)
         chosen = preferred or candidates[0]
         others = [f"col {i} ({_norm(header[i]) or '?'})" for i, _ in candidates if i != chosen[0]]
@@ -358,6 +371,15 @@ def _parse_sheet(name: str, rows: list[list]) -> tuple[dict | None, list[str], d
             if val in (None, ""):
                 continue
             label = header[c] if header[c] else f"col{c}"
+            # A multi-year block repeats a header ("14 pagas" for 2025 AND for
+            # 2026 — COEAS Navarra): without a suffix the later column silently
+            # OVERWRITES the earlier one and a printed figure is lost, which is
+            # the one thing raw_values exists to prevent.
+            if label in raw_values:
+                suffix = 2
+                while f"{label} ({suffix})" in raw_values:
+                    suffix += 1
+                label = f"{label} ({suffix})"
             raw_values[label] = val if not isinstance(val, float) else round(val, 6)
             field = field_map.get(c)
             if field == "gross_annual":
