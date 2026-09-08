@@ -106,6 +106,28 @@ Python + FastAPI service for the HR platform's RAG and reasoning pipeline. See
 > out the overlapping passage — a **safety gate reporting "no conflict" when there
 > is one**. hr-backend uses it for the semantic publish fence, the §8.5 reverse
 > re-check and the succession proposal, and owns every resulting decision and write.
+>
+> **Sprint 7e: the OCR fallback for scanned/text-less pages (ADR-0026).** `/extract`
+> gains `ocr`/`ocr_page_cap` and now returns a per-page `extraction_source`
+> (`text_layer` | `ocr_pending`), computed from the page's existing native text
+> check — it **never calls the OCR model inline** (queued/async is hr-backend's
+> job, mirroring 7a's `ProposeDocumentTags`). The actual OCR call is a **new**
+> endpoint, `POST /ocr-page`: reads the already-rendered page image from S3 (never
+> re-renders), calls `ClaudeProvider.ocr_page()` (a new provider method, same
+> key-in-the-body/never-persisted posture, `OCR_MODEL`/`ocr_model` = `claude-opus-5`,
+> **decoupled** from `ANSWER_MODEL` so an answer-quality change can never silently
+> retarget OCR), and returns plain text for `document_pages.text` **plus** writes a
+> structured **S3 sidecar** (`documents/{uuid}/ocr/{page:04d}.json` — column-split,
+> language-tagged units + table rows, under hr-ai's existing S3-write privilege; no
+> migration). `extract_language_streams`/`build_chunks` probe for that sidecar
+> **only** when a page's native block count is zero and append its units into the
+> `es`/`eu` accumulators before the final sort — `_classify_page`, the furniture
+> pass, and the bilingual gate are **untouched**. The OCR prompt pins table
+> placement deterministically (title → a header unit, footnotes/plus-lines → an
+> `es` text unit, only the grid → `table_rows` — never left to the model's
+> placement choice) and never cleans up/normalizes the transcribed text. hr-ai
+> still **never migrates** and writes only the sidecar (S3, not DB) for this
+> feature.
 
 ## Requirements
 
@@ -144,10 +166,27 @@ uvicorn app.main:app --reload --port 8001
 - `GET /health/db` → DB connectivity check; `200`/`503`
 - `GET /health/config` → echoes non-secret config (`EMBED_MODEL`, `EMBED_DIM`,
   `ANSWER_PROVIDER`, `ANSWER_MODEL`, `ANSWER_ENDPOINT`, `ROUTER_MODEL`,
-  `ROUTER_ENDPOINT` — the answer key is **not** here; it arrives per call from
-  `hr-backend`)
-- `POST /extract` (**internal**) — body `{ storage_key, document_uuid }`. PDF →
-  per-page text + page-image S3 keys (Sprint 1). `hr-backend` persists the rows.
+  `ROUTER_ENDPOINT`, `OCR_MODEL` — the answer key is **not** here; it arrives per
+  call from `hr-backend`)
+- `POST /extract` (**internal**) — body `{ storage_key, document_uuid, ocr?,
+  ocr_page_cap? }`. PDF → per-page text + page-image S3 keys + a per-page
+  `extraction_source` (Sprint 1; `ocr`/`ocr_page_cap` added Sprint 7e/ADR-0026 —
+  `"ocr_pending"` marks a text-less page for the queued OCR job below; hr-ai
+  never calls the OCR model here). `hr-backend` persists the rows.
+- `POST /ocr-page` (**internal**, Sprint 7e, ADR-0026) — body
+  `{ document_uuid, page_number, image_key, provider_api_key, provider_config }`.
+  Fetches the already-rendered page image from S3 (never re-renders), calls
+  `ClaudeProvider.ocr_page()` (`OCR_MODEL`, default `claude-opus-5` — a decoupled
+  config from `ANSWER_MODEL`), and **returns** `{ text, quality_inputs:{…},
+  bilingual, trace_fragment }` for hr-backend to persist onto `document_pages`.
+  Also **writes** the structured S3 sidecar
+  `documents/{uuid}/ocr/{page:04d}.json` (column-split, language-tagged units +
+  table rows, per the pinned table contract — title → a header unit,
+  footnotes/plus-lines → an `es` text unit, only the grid → `table_rows`) — this
+  is hr-ai's **only** write for this feature (S3, not DB; no migration). Called
+  once per `ocr_pending` page by hr-backend's queued `OcrPage` job, never inline
+  from `/extract` (23–70s/page measured). Same key-in-the-body/never-persisted
+  posture as every other provider call.
 - `POST /embed` (**internal**) — body
   `{ document_id, document_uuid, storage_key, scope }` where `scope` carries the
   hr-backend-resolved `{ convenio_id, territory_id, sector_id, validity_start,
@@ -155,7 +194,14 @@ uvicorn app.main:app --reload --port 8001
   de-spaces, article-chunks, embeds, and **writes `document_chunks`** (idempotent
   per document). Returns `{ chunks_written, language_streams, stats }` where
   `stats` includes `furniture_blocks_stripped`, `repeating_furniture_lines`,
-  `pages_not_cleanly_split` (for the eyes-on gate).
+  `pages_not_cleanly_split` (for the eyes-on gate). **Sprint 7e (ADR-0026,
+  additive, request/response unchanged):** when a page's native block count is
+  zero, `extract_language_streams` probes for that page's OCR sidecar
+  (`documents/{uuid}/ocr/{page:04d}.json`) and, if present, appends its
+  column-split, language-tagged units into the `es`/`eu` accumulators before the
+  final sort (Option B) — the only path an OCR'd page's text reaches
+  `document_chunks` through (`document_pages.text` alone is not read here). No
+  change to `_classify_page`, the furniture pass, or the bilingual gate.
 - `POST /extract-salary` (**internal**) — body `{ storage_key, document_uuid }`.
   Parses the `.xlsx` (skips junk sheets, finds the header row, maps cryptic
   columns per format, multi-year → many tables) and **returns**

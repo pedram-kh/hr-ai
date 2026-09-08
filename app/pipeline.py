@@ -18,20 +18,26 @@ from .embeddings import count_tokens, embed_texts
 from .storage import get_object_bytes
 
 
-def build_chunks(pdf_bytes: bytes) -> tuple[list[dict], dict]:
-    """Synchronous CPU work: extract columns → chunk. Returns (chunks, stats)."""
-    extracted = extract_language_streams(pdf_bytes)
+def build_chunks(pdf_bytes: bytes, document_uuid: str | None = None) -> tuple[list[dict], dict]:
+    """Synchronous CPU work: extract columns → chunk. Returns (chunks, stats).
+
+    `document_uuid` (Sprint 7e, ADR-0026, additive/optional) lets
+    `extract_language_streams` probe for an OCR sidecar on any page with zero
+    native blocks (review.md §2.3, Option B) — omitted, behavior is unchanged.
+    """
+    extracted = extract_language_streams(pdf_bytes, document_uuid)
     chunks = chunk_document(extracted["streams"], count_tokens)
     return chunks, extracted["stats"]
 
 
 async def embed_document(
     document_id: int,
+    document_uuid: str,
     storage_key: str,
     scope: dict,
 ) -> dict:
     pdf_bytes = await asyncio.to_thread(get_object_bytes, storage_key)
-    chunks, stats = await asyncio.to_thread(build_chunks, pdf_bytes)
+    chunks, stats = await asyncio.to_thread(build_chunks, pdf_bytes, document_uuid)
 
     embeddings: list[list[float]] = []
     if chunks:

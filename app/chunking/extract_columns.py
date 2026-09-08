@@ -26,6 +26,7 @@ silent legal gap). Two governing rules follow from that:
 
 from __future__ import annotations
 
+import json
 import re
 
 import fitz  # PyMuPDF
@@ -152,13 +153,26 @@ def _classify_page(pbs: list[dict], pw: float, ph: float) -> dict:
     return {"two_column": two_column, "tabular": tabular, "has_straddle": svol > 0}
 
 
-def extract_language_streams(pdf_bytes: bytes) -> dict:
+def extract_language_streams(pdf_bytes: bytes, document_uuid: str | None = None) -> dict:
     """Return per-language page-tagged text units + extraction stats.
 
     {
       "streams": {"es": [(page_number, text), ...], "eu": [(page_number, text), ...]},
       "stats": {...},
     }
+
+    `document_uuid` is additive and optional (Sprint 7e, ADR-0026, review.md
+    §2.3, Option B) — when given, any page with ZERO native text blocks (a
+    scanned page — this pass's own `get_text("rawdict")` naturally returns none)
+    is probed for an OCR sidecar at `documents/{uuid}/ocr/{page:04d}.json`
+    (written once, at OCR time, by `app/ocr.py`). If present, its already
+    column-split, already language-tagged units are appended straight into the
+    `es`/`eu` accumulators below, BEFORE the final sort — never through
+    `_classify_page`, the furniture pass, or the bilingual `_es_ratio` gate,
+    every one of which only ever sees native-PDF blocks (unchanged either way).
+    Omitting `document_uuid` (every existing caller before this sprint)
+    reproduces the exact prior behavior byte-for-byte — a page with zero native
+    blocks simply contributes nothing, as it always did.
     """
     ratio = settings.chunk_space_gap_ratio
     repeat_fraction = settings.chunk_repeat_furniture_min_page_fraction
@@ -170,6 +184,7 @@ def extract_language_streams(pdf_bytes: bytes) -> dict:
         # --- Pass 1: collect de-spaced text blocks with geometry ---
         blocks: list[dict] = []
         long_token_flags = 0
+        pages_with_native_blocks: set[int] = set()
         for index in range(page_count):
             page = doc.load_page(index)
             page_number = index + 1
@@ -199,8 +214,10 @@ def extract_language_streams(pdf_bytes: bytes) -> dict:
                         "furniture": False,
                     }
                 )
+                pages_with_native_blocks.add(page_number)
 
         blocks_total = len(blocks)
+        pages_without_native_blocks = [p for p in range(1, page_count + 1) if p not in pages_with_native_blocks]
 
         # --- Pass 2: mark furniture (Correction-01, change 2) ---
         # Furniture is REPETITION at a margin band — NOT bare full width. A
@@ -300,6 +317,49 @@ def extract_language_streams(pdf_bytes: bytes) -> dict:
                 if layout["tabular"]:
                     pages_not_cleanly_split.append(page_number)
 
+        # --- Pass 4 (Sprint 7e, ADR-0026, review.md §2.3 — Option B): OCR
+        # sidecar probe. ONLY pages with ZERO native blocks are probed — a page
+        # `_classify_page`/the furniture pass already handled above is never
+        # touched again here, so nothing about the native path changes. A page
+        # that HAD native blocks (even if every one got stripped as furniture,
+        # leaving it out of `by_page`) is NOT a sidecar candidate — that is a
+        # furniture-stripping outcome, not a scanned page, and re-probing it
+        # would silently blend two different provenances into one stream.
+        ocr_sidecar_pages_used: list[int] = []
+        if document_uuid:
+            from ..ocr import ocr_sidecar_key
+            from ..storage import get_object_bytes
+
+            for page_number in pages_without_native_blocks:
+                try:
+                    raw_sidecar = get_object_bytes(ocr_sidecar_key(document_uuid, page_number))
+                except Exception:  # noqa: BLE001 - no sidecar (or a transient S3 miss) → contribute nothing, same as before this sprint
+                    continue
+                try:
+                    sidecar = json.loads(raw_sidecar)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+                for col in sidecar.get("columns") or []:
+                    text = col.get("text", "")
+                    if not text or not str(text).strip():
+                        continue
+                    order = col.get("order", 0)
+                    lang = col.get("language", "es")
+                    target = eu if lang == "eu" else es
+                    target.append((page_number, order, 0.0, str(text)))
+
+                table_rows = sidecar.get("table_rows") or []
+                if table_rows:
+                    rendered = "\n".join(" | ".join(str(cell) for cell in row) for row in table_rows)
+                    # Ordered after every real column on this page (there is at
+                    # most one sidecar per page, so this order index is only
+                    # ever a tie-break against the columns loop just above).
+                    max_order = max((c.get("order", 0) for c in (sidecar.get("columns") or [])), default=-1)
+                    es.append((page_number, max_order + 1, 0.0, rendered))
+
+                ocr_sidecar_pages_used.append(page_number)
+
         def _stream(units: list[tuple[int, int, float, str]]) -> list[tuple[int, str]]:
             units.sort(key=lambda u: (u[0], u[1], u[2]))
             return [(p, t) for p, _, _, t in units]
@@ -316,6 +376,7 @@ def extract_language_streams(pdf_bytes: bytes) -> dict:
                 "column_blocks_kept": len(column_blocks),
                 "furniture_blocks_stripped": furniture_stripped,
                 "repeating_furniture_lines": repeating_furniture_lines,
+                "ocr_sidecar_pages_used": ocr_sidecar_pages_used,
                 "pages_not_cleanly_split": sorted(set(pages_not_cleanly_split)),
                 "long_token_flags": long_token_flags,
             },

@@ -26,6 +26,7 @@ from .base import (
     ConvenioCandidate,
     GroundChunk,
     GroundingResult,
+    OcrPageResult,
     ProviderConfig,
     RouterResult,
     SegmentedFactsResult,
@@ -555,6 +556,88 @@ def _build_ground_prompt(question: str, answer: str, chunks: list[GroundChunk]) 
         "envoltorio atributivo es sustantiva. Devuelve solo el JSON."
     )
     return "\n".join(lines)
+
+
+# --- OCR (Sprint 7e, ADR-0026) — vision transcription of a text-less page ----
+# The system prompt below is the PRODUCTION COPY of the exact prompt scored in
+# the engine/model eval (`hr-docs/sprints/sprint-07e/eval/engines/claude_vision.py`
+# `SYSTEM_PROMPT`), including the Round-2 Adjustment 2 pinned table-placement
+# contract (review.md §1.6/§2.2: a table page's title lives ONLY in
+# `article_headers`; a footnote/plus-line block lives ONLY in one `columns` `es`
+# entry; `table_rows` holds ONLY the grid — never left to the model's choice).
+# Keep the two copies in lockstep: a prompt change here without a matching eval
+# change (or vice versa) would silently invalidate ADR-0026's measured decision.
+OCR_SYSTEM_PROMPT = (
+    "Eres un transcriptor OCR. Tu única tarea es TRANSCRIBIR EXACTAMENTE el "
+    "texto visible en la imagen de una página escaneada de un convenio "
+    "colectivo español (a veces bilingüe euskera/castellano). NUNCA corrijas, "
+    "completes, modernices, resumas ni \"limpies\" el texto — transcribe "
+    "literalmente lo que ves, incluyendo erratas, mayúsculas y saltos de "
+    "línea de artículo. Si una palabra es ilegible, escribe [ilegible] en su "
+    "lugar en vez de inventarla.\n\n"
+    "PASO 1 — determina el layout de la página:\n"
+    '  - "two_column_bilingual": dos columnas verticales separadas por un '
+    "gutter central, cada una en un idioma distinto (euskera / castellano).\n"
+    '  - "two_column_monolingual": dos columnas verticales, ambas en '
+    "castellano (layout tipo periódico, NO bilingüe).\n"
+    '  - "single_column": una sola columna de prosa (aunque tenga un margen '
+    "o índice lateral corto).\n"
+    '  - "table": una tabla/rejilla salarial o anexo con filas y columnas de '
+    "datos, sin prosa corrida.\n\n"
+    "PASO 2 — transcribe según el layout:\n"
+    '  - two_column_bilingual / two_column_monolingual: devuelve "columns" '
+    "con DOS entradas, cada una con su \"order\" (0=izquierda, 1=derecha), "
+    "su \"language\" (\"es\" o \"eu\" — para monolingüe ambas \"es\"), y su "
+    "\"text\" completo en orden de lectura de arriba a abajo DENTRO de esa "
+    "columna (nunca intercales texto de la otra columna).\n"
+    '  - single_column: devuelve "columns" con UNA entrada, order=0, '
+    "language=\"es\" o \"eu\".\n"
+    '  - table: CONTRATO DE COLOCACIÓN FIJO para páginas de tabla (nunca lo '
+    "dejes a tu criterio) — \"table_rows\" contiene EXCLUSIVAMENTE la rejilla "
+    "de filas/columnas de datos (cabecera de columnas + filas de valores), "
+    "una lista de listas de celdas, izquierda a derecha, arriba a abajo. Un "
+    "título de tabla/anexo (p. ej. \"ANEXO I: TABLA SALARIAL...\") NUNCA es "
+    "una fila de table_rows — va SOLO en \"article_headers\" (paso 3). Un "
+    "pie de tabla o nota a pie (p. ej. \"Plus Festivo: 3,18 €/h.\", "
+    "\"Kilometraje: 0,21 €/km.\") NUNCA es una fila de table_rows — va en "
+    "\"columns\" como UNA entrada order=0, language=\"es\", con todas las "
+    "líneas de nota unidas por salto de línea. Si no hay título o no hay "
+    "notas al pie, simplemente omite esa parte (no inventes una entrada "
+    "vacía). table_rows queda EXACTAMENTE del mismo tamaño que la rejilla "
+    "visible — nunca una fila más por el título, nunca una fila más por "
+    "una nota.\n\n"
+    "PASO 3 — \"article_headers\": lista TODAS las cabeceras de artículo/"
+    "capítulo/disposición que veas literalmente como aparecen (p. ej. "
+    "\"Artículo 22\", \"22. artikulua\", \"CAPÍTULO V\", \"Disposición "
+    "adicional primera\"), UNA por línea de cabecera, en el orden en que "
+    "aparecen en la página. En una página \"table\", el TÍTULO de la tabla/"
+    "anexo (p. ej. \"ANEXO I: TABLA SALARIAL DE 1-1-2025 A 31-12-2025\") es "
+    "TAMBIÉN una cabecera y va aquí, no en table_rows.\n\n"
+    "FORMATO DE SALIDA: devuelve EXCLUSIVAMENTE un objeto JSON válido, sin "
+    "texto alrededor ni backticks:\n"
+    '{"layout": "two_column_bilingual|two_column_monolingual|single_column|table", '
+    '"columns": [{"order": 0, "language": "es|eu", "text": "..."}], '
+    '"table_rows": [["cell", "cell"]], '
+    '"article_headers": ["..."]}'
+)
+
+OCR_USER_PROMPT = (
+    "Transcribe esta página escaneada siguiendo exactamente las instrucciones "
+    "del sistema. Devuelve solo el JSON."
+)
+
+# Same table, same source, same date as the eval's copy (`eval/engines/
+# claude_vision.py`'s `PRICING_PER_MTOK`) — checked 2026-09-07. Kept in
+# lockstep: `cost_usd` here must match what the eval measured, or ADR-0026's
+# "≈$3 for the whole backfill" projection silently drifts from reality.
+OCR_PRICING_PER_MTOK: dict[str, tuple[float, float]] = {
+    "claude-sonnet-4-5": (3.00, 15.00),
+    "claude-sonnet-5": (2.00, 10.00),
+    "claude-opus-5": (5.00, 25.00),
+}
+_OCR_DEFAULT_PRICING = (3.00, 15.00)
+
+OCR_MAX_TOKENS = 4096
 
 
 class ClaudeProvider(AnswerProvider):
@@ -1124,4 +1207,90 @@ class ClaudeProvider(AnswerProvider):
                 "truncated": truncated,
                 "salvaged": salvaged,
             },
+        )
+
+    def ocr_page(
+        self,
+        image_bytes: bytes,
+        api_key: str,
+        config: ProviderConfig,
+    ) -> OcrPageResult:
+        """OCR one already-rendered page image (Sprint 7e, ADR-0026). Literal
+        transcription only (no cleanup — see `OCR_SYSTEM_PROMPT`), bound to the
+        pinned table-placement contract. On a parse failure returns
+        `layout="parse_error"` with everything else empty so the caller (`app/
+        ocr.py`) can surface a `provider_error` and leave the page `ocr_pending`
+        for a retry — the same conservative shape every other parse-failure
+        branch in this file already uses, never a guess at page content."""
+        import base64
+
+        import anthropic  # lazy — dep only needed at call time
+
+        client = anthropic.Anthropic(api_key=api_key, base_url=config.endpoint or None)
+        image_b64 = base64.standard_b64encode(image_bytes).decode("ascii")
+
+        started = time.monotonic()
+        resp = client.messages.create(
+            model=config.model,
+            max_tokens=OCR_MAX_TOKENS,
+            system=OCR_SYSTEM_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64},
+                        },
+                        {"type": "text", "text": OCR_USER_PROMPT},
+                    ],
+                }
+            ],
+        )
+        elapsed_s = time.monotonic() - started
+
+        raw_text = "".join(
+            block.text for block in resp.content if getattr(block, "type", None) == "text"
+        )
+        in_tok = getattr(resp.usage, "input_tokens", 0) or 0
+        out_tok = getattr(resp.usage, "output_tokens", 0) or 0
+        price_in, price_out = OCR_PRICING_PER_MTOK.get(config.model, _OCR_DEFAULT_PRICING)
+        cost_usd = round((in_tok / 1_000_000) * price_in + (out_tok / 1_000_000) * price_out, 6)
+        trace_fragment = {
+            "provider": config.provider,
+            "model": config.model,
+            "sec_per_page": round(elapsed_s, 3),
+            "cost_usd": cost_usd,
+            "prompt_tokens": in_tok,
+            "completion_tokens": out_tok,
+        }
+
+        try:
+            envelope = _extract_json(raw_text)
+        except (json.JSONDecodeError, ValueError):
+            return OcrPageResult(
+                layout="parse_error",
+                trace_fragment={**trace_fragment, "parse_error": True},
+            )
+
+        layout = str(envelope.get("layout", "single_column")).strip() or "single_column"
+        columns = [c for c in (envelope.get("columns") or []) if isinstance(c, dict)]
+        table_rows = [r for r in (envelope.get("table_rows") or []) if isinstance(r, list)]
+        article_headers = [str(h) for h in (envelope.get("article_headers") or [])]
+
+        # Bilingual iff a genuine two-column layout AND the two columns' own
+        # reported languages differ — the same test extract_columns.py's native
+        # path applies (one column reads as `eu`, the other `es`), just reading
+        # the model's self-reported `language` instead of re-deriving it from
+        # `_es_ratio` (the model already did that classification in PASO 2).
+        languages = {str(c.get("language", "")).strip() for c in columns}
+        bilingual = layout.startswith("two_column") and len(languages) > 1
+
+        return OcrPageResult(
+            layout=layout,
+            columns=columns,
+            table_rows=table_rows,
+            article_headers=article_headers,
+            bilingual=bilingual,
+            trace_fragment=trace_fragment,
         )

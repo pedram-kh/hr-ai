@@ -101,6 +101,22 @@ class Settings(BaseSettings):
     router_model: str = "claude-haiku-4-5"
     router_endpoint: str = ""  # empty → falls back to answer_endpoint
 
+    # --- OCR fallback (Sprint 7e, ADR-0026) ---
+    # Deliberately its OWN config value, never aliased to answer_model: the
+    # engine eval (sprint-07e/eval/, review.md §1) scored THREE Claude models
+    # against human-corrected gold and the winner is NOT claude-sonnet-4-5 (the
+    # current answer_model default) — claude-opus-5 measurably beats both
+    # claude-sonnet-4-5 and claude-sonnet-5 on header survival, table-cell
+    # accuracy, and eu-language WER, and its cost is trivial at the actual
+    # backfill's page volume (≤105 pages) even though it's the most expensive
+    # of the three per page. If answer_model is ever changed for unrelated
+    # (chat-quality) reasons, ocr_model must NOT silently follow it — the OCR
+    # decision is its own eval, its own ADR, its own model. Same EU-endpoint
+    # constraint as answer_model/router_model applies (deploy.md §1); the
+    # endpoint defaults to answer_endpoint unless overridden.
+    ocr_model: str = "claude-opus-5"
+    ocr_endpoint: str = ""  # empty → falls back to answer_endpoint
+
     # DEPRECATED placeholder kept for /health/config back-compat; the real key is
     # never stored in hr-ai (ADR-0015) — it arrives per call from hr-backend.
     anthropic_api_key: str = ""
