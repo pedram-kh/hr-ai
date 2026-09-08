@@ -206,12 +206,16 @@ uvicorn app.main:app --reload --port 8001
   Parses the `.xlsx` (skips junk sheets, finds the header row, maps cryptic
   columns per format, multi-year → many tables) and **returns**
   `{ tables:[{ sheet, year, rows:[{ job_category_name, group_code, gross_annual,
-  base_salary_monthly, pagas_count, hourly_rate, extra_pay, night_plus,
-  raw_values }] }], warnings, sheet_diagnostics }`. hr-ai writes nothing;
+  base_salary_monthly, base_salary_monthly_label, pagas_count, hourly_rate,
+  extra_pay, night_plus, raw_values }] }], warnings, sheet_diagnostics }`. hr-ai writes nothing;
   hr-backend writes the rows. **Correction-salary-01:** `base_salary_monthly` is
   read from a monthly column the source labels as such and is **NULL** when there
-  is none (it is never `gross_annual / 14`), and `pagas_count` is set only when a
-  header states it ("14 pagas") and never used to derive. `sheet_diagnostics`
+  is none (it is never `gross_annual / 14`); it travels with
+  `base_salary_monthly_label`, the header it was read from **verbatim**, because a
+  sheet can print several monthly quantities that are not interchangeable
+  (`salario base` vs `bruto mes`) and the answer names each by its own column; and
+  `pagas_count` is set only when a header states it ("14 pagas") and never used to
+  derive. `sheet_diagnostics`
   reports per sheet `ok` | `empty` | `no_header` | `header_but_no_rows` |
   `header_maps_to_nothing`, which is what lets `salary:import` fail loudly
   instead of reporting success over a recognized-but-empty grid.
