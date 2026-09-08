@@ -206,8 +206,15 @@ uvicorn app.main:app --reload --port 8001
   Parses the `.xlsx` (skips junk sheets, finds the header row, maps cryptic
   columns per format, multi-year → many tables) and **returns**
   `{ tables:[{ sheet, year, rows:[{ job_category_name, group_code, gross_annual,
-  base_salary_monthly, num_payments, hourly_rate, extra_pay, night_plus,
-  raw_values }] }], warnings }`. hr-ai writes nothing; hr-backend writes the rows.
+  base_salary_monthly, pagas_count, hourly_rate, extra_pay, night_plus,
+  raw_values }] }], warnings, sheet_diagnostics }`. hr-ai writes nothing;
+  hr-backend writes the rows. **Correction-salary-01:** `base_salary_monthly` is
+  read from a monthly column the source labels as such and is **NULL** when there
+  is none (it is never `gross_annual / 14`), and `pagas_count` is set only when a
+  header states it ("14 pagas") and never used to derive. `sheet_diagnostics`
+  reports per sheet `ok` | `empty` | `no_header` | `header_but_no_rows` |
+  `header_maps_to_nothing`, which is what lets `salary:import` fail loudly
+  instead of reporting success over a recognized-but-empty grid.
 - `POST /read-structured` (**internal**, Sprint 7b-1, ADR-0021) — body
   `{ storage_key, document_uuid, format }` (`format` ∈ `docx` | `xlsx`). Reads a
   **non-salary** `.docx` (python-docx) or `.xlsx` (openpyxl) and **returns**
