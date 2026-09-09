@@ -26,6 +26,7 @@ from .base import (
     ConvenioCandidate,
     GroundChunk,
     GroundingResult,
+    GroupProposalResult,
     OcrPageResult,
     ProviderConfig,
     RouterResult,
@@ -316,6 +317,170 @@ GROUND_MAX_TOKENS_RETRY = 8192
 # headroom (well within Sonnet's output limit); `_salvage_facts` is the residual
 # safety net so a truncation degrades to "most facts" rather than "no facts".
 SEGMENT_MAX_TOKENS = 32000
+
+
+# --- Group structure tier (Sprint 7f, ADR-0028) — read ONE convenio, PROPOSE ---
+# its group tree. This is the vocabulary the answer path will later compare
+# EXACTLY (`convenio_groups.id`, an integer), replacing the bare-digit regex that
+# cannot express "área 5 of Grupo 2". No AI runs at answer time; this runs once,
+# per convenio, and a human approves every node before anything is comparable.
+PROPOSE_GROUPS_SYSTEM_PROMPT = (
+    "Eres un analista de convenios colectivos españoles. Tu tarea es leer el texto de UN convenio "
+    "y proponer su ESTRUCTURA DE GRUPOS PROFESIONALES: los grupos y, cuando corresponda, las áreas "
+    "dentro de un grupo.\n"
+    "\n"
+    "NO DECIDES NADA. Todo lo que devuelvas es una PROPUESTA que una persona revisará y aprobará "
+    "o rechazará. Nada de lo que digas se aplica automáticamente. Por eso es mejor proponer algo "
+    "marcado como incierto que callarlo, y siempre es mejor no proponer que inventar.\n"
+    "\n"
+    "═══ LA REGLA MÁS IMPORTANTE: LA GRANULARIDAD SIGUE A LOS VALORES ═══\n"
+    "Propón un ÁREA dentro de un grupo SOLO SI el texto asigna VALORES DISTINTOS a esas partes "
+    "del grupo. Ejemplo real: si el convenio dice que el periodo de prueba del Grupo 2 es de 90 "
+    "días para el área 5 y de 60 días para el resto de áreas, entonces el Grupo 2 tiene dos áreas "
+    "('área 5' y 'resto áreas') porque el convenio las trata de forma distinta.\n"
+    "Si el convenio solo MENCIONA áreas, o las enumera sin darles condiciones distintas, propón "
+    "UN SOLO nodo para el grupo y NINGUNA área. Dividir un grupo que el convenio no divide es un "
+    "error grave: obliga al sistema a exigir una distinción que el convenio nunca hizo, y una "
+    "pregunta que hoy se responde bien pasaría a derivarse a una persona.\n"
+    "Solo hay DOS niveles: grupo y área dentro de un grupo. Nunca un área dentro de un área.\n"
+    "\n"
+    "═══ CADA NODO NECESITA UNA CITA ═══\n"
+    "Todo nodo lleva `source_excerpt`: la línea o líneas EXACTAS del convenio que lo justifican, "
+    "copiadas literalmente, y `source_locator` (p. ej. 'p.12'). Un ÁREA SIN CITA NO ES VÁLIDA: si "
+    "no puedes citar dónde el convenio da un valor distinto a esa parte del grupo, no propongas "
+    "el área. No parafrasees la cita ni la reconstruyas de memoria.\n"
+    "\n"
+    "═══ LAS ETIQUETAS SE COPIAN, NO SE NORMALIZAN ═══\n"
+    "`code_label` es la etiqueta TAL CUAL la imprime el convenio: 'Grupo 2', 'Grupo I', "
+    "'Obreros y subalternos', 'área 5', 'resto áreas'. No la traduzcas, no la numeres, no la "
+    "conviertas de romano a árabe, no la pongas en minúsculas ni le inventes un código. Otro "
+    "componente se encarga de eso. Muchos convenios no numeran sus grupos: "
+    "'Técnicos titulados' o 'Personal técnico y administrativo' son grupos perfectamente válidos.\n"
+    "`code_label` es el IDENTIFICADOR del grupo, NO su titular completo. Si el convenio escribe "
+    "'Grupo I. Personal directivo' o 'Grupo III: personal de atención directa', el `code_label` es "
+    "'Grupo I' / 'Grupo III' y la descripción va en `source_excerpt`, donde es útil para quien "
+    "revisa. Esto importa: el mismo convenio suele numerar el grupo en su articulado ('grupo 1') y "
+    "titularlo en su anexo ('Grupo I. Personal directivo'), y son EL MISMO grupo — un solo nodo. "
+    "Solo cuando el grupo NO tiene número ni romano (p. ej. 'Técnicos titulados') el nombre ES el "
+    "identificador.\n"
+    "Un nodo es un ÁREA cuando `parent_code_label` es la etiqueta de su grupo; es un GRUPO cuando "
+    "`parent_code_label` es null.\n"
+    "NO propongas un nodo compuesto: si el convenio dice 'Grupos 1 y 2', eso NO es un grupo "
+    "llamado 'Grupos 1 y 2' — son dos grupos, 'Grupo 1' y 'Grupo 2'. Que un mismo artículo les "
+    "dé el mismo valor se resolverá después vinculando ese dato a los dos grupos.\n"
+    "\n"
+    "═══ LAS CATEGORÍAS SON UN CONJUNTO CERRADO ═══\n"
+    "En `job_category_ids` puedes adjuntar a un nodo categorías profesionales que YA EXISTEN, "
+    "usando sus ids de la lista que se te da. NUNCA inventes una categoría, ni propongas crearla, "
+    "ni devuelvas un id que no esté en la lista. Si una categoría no encaja en ningún grupo, "
+    "déjala fuera: no adjuntarla es una respuesta válida y frecuente.\n"
+    "Muchas filas de esa lista NO son categorías reales — son importes salariales, años, o "
+    "conceptos de nómina ('Plus transporte', 'Nocturnidad', 'Coordinacion'). Esas NO se adjuntan "
+    "a ningún grupo.\n"
+    "El campo `group_code` de esas categorías es solo un INDICIO de cómo estaba maquetada una hoja "
+    "de cálculo: en el corpus real la mayoría está vacío y varios contienen importes o años. "
+    "Úsalo como pista, nunca como verdad, y si el texto del convenio lo contradice, IGNÓRALO. "
+    "El texto del convenio es la única fuente.\n"
+    "\n"
+    "═══ ETIQUETAS YA EN USO ═══\n"
+    "Se te dan las etiquetas de grupo que ya usan datos de referencia VERIFICADOS por una persona "
+    "para este convenio. Son una LISTA DE COMPROBACIÓN, no una fuente: si tu estructura no puede "
+    "expresar una de ellas, es señal de que te falta un grupo o un área, porque ese dato "
+    "verificado quedaría sin poder vincularse. Aun así, cada nodo que propongas debe justificarse "
+    "con una cita del convenio, no con la etiqueta.\n"
+    "\n"
+    "═══ CUANDO EL CONVENIO IMPRIME EL GRUPO UNA SOLA VEZ POR BLOQUE ═══\n"
+    "Es habitual que una tabla imprima 'Grupo III:' como cabecera y luego varias filas sin repetir "
+    "el grupo. Puedes proponer que esas filas pertenecen a ese grupo, PERO: cita el bloque "
+    "(la cabecera y las filas que abarca) en `source_excerpt` y marca "
+    "`uncertainty` = {\"field\": \"membership\", \"reason\": \"...\"}. Es una hipótesis razonable "
+    "sobre la maquetación, no un hecho del texto, y quien revise debe verlo como tal.\n"
+    "\n"
+    "═══ INCERTIDUMBRE: SEÑÁLALA, NO LA RESUELVAS ═══\n"
+    "`uncertainty` es {\"field\": \"structure|membership|area|label\", \"reason\": \"<por qué>\"} "
+    "o null. Si dudas de si algo es un grupo o una categoría, si el texto está dañado por OCR, o "
+    "si no sabes si un área merece nodo propio, PROPÓN Y MARCA. No adivines en silencio.\n"
+    "\n"
+    "FORMATO DE SALIDA: devuelve EXCLUSIVAMENTE un objeto JSON válido, sin texto alrededor, "
+    "con esta forma:\n"
+    '{"groups": [{"code_label": "<etiqueta tal cual>", '
+    '"parent_code_label": "<etiqueta del grupo padre|null>", '
+    '"job_category_ids": [<ids existentes>], '
+    '"source_excerpt": "<línea(s) exactas del convenio>", "source_locator": "<p.N>", '
+    '"confidence": <0..1>, '
+    '"uncertainty": {"field": "structure|membership|area|label", "reason": "<por qué>"}}], '
+    '"notes": "<qué no pudiste determinar, o cadena vacía>"}'
+)
+
+# One convenio's own text. Doc 51 (Hostelería Navarra) is 30 pages and doc 56
+# (COEAS Álava) is 43, so the cap has to hold a whole convenio rather than a
+# fixture-sized file — the group structure is usually stated in one article, but
+# WHICH article varies, so the model needs the whole text to find it.
+PROPOSE_GROUPS_TEXT_CAP = 180000
+
+# A group tree is small (a handful of nodes with one excerpt each), so this needs
+# nothing like SEGMENT_MAX_TOKENS. 8192 is ample and keeps the call non-streaming.
+PROPOSE_GROUPS_MAX_TOKENS = 8192
+
+
+def _group_category_block(convenio: ConvenioCandidate) -> str:
+    """The CLOSED category set for one convenio, with `group_code` marked as the
+    weak evidence it is (see the system prompt's category section)."""
+    if not convenio.job_categories:
+        return (
+            "Categorías profesionales existentes: NINGUNA.\n"
+            "  Este convenio no tiene ninguna categoría cargada, lo cual es normal y no es un "
+            "problema: propón solo grupos y áreas, sin adjuntar categorías. La estructura de "
+            "grupos es suficiente por sí sola."
+        )
+
+    lines = [
+        "Categorías profesionales existentes (conjunto CERRADO — usa solo estos ids, "
+        "nunca inventes ni crees ninguna):",
+    ]
+    for jc in convenio.job_categories:
+        evidence = f"   [indicio group_code: {jc.group_code!r} — puede ser basura, verifícalo contra el texto]" if jc.group_code else ""
+        lines.append(f"  - id={jc.id}: {jc.name}{evidence}")
+    return "\n".join(lines)
+
+
+def _build_propose_groups_prompt(
+    convenio: ConvenioCandidate,
+    pages_text: str,
+    observed_group_labels: list[str],
+) -> str:
+    text = (pages_text or "").strip()
+    truncated = len(text) > PROPOSE_GROUPS_TEXT_CAP
+    if truncated:
+        text = text[:PROPOSE_GROUPS_TEXT_CAP] + "\n…[texto truncado]"
+
+    blocks = [
+        f"CONVENIO: {convenio.name}"
+        + (f" (nº {convenio.numero})" if convenio.numero else "")
+        + (f" · territorio: {convenio.territory_name}" if convenio.territory_name else "")
+        + (f" · sector: {convenio.sector_name}" if convenio.sector_name else ""),
+        "",
+        "TEXTO DEL CONVENIO (la única fuente de verdad — toda cita debe salir de aquí):",
+        text,
+        "",
+        _group_category_block(convenio),
+    ]
+
+    if observed_group_labels:
+        blocks.append("")
+        blocks.append(
+            "Etiquetas de grupo que ya usan datos de referencia VERIFICADOS de este convenio "
+            "(lista de comprobación, no fuente — tu estructura debería poder expresarlas todas):"
+        )
+        blocks.extend(f"  - {label}" for label in observed_group_labels)
+
+    blocks.append("")
+    blocks.append(
+        "Propón la estructura de grupos de este convenio. Un área dentro de un grupo SOLO si el "
+        "texto le da valores distintos, y siempre con su cita. Copia las etiquetas tal cual. "
+        "No inventes categorías. Marca lo que no puedas determinar. Devuelve solo el JSON."
+    )
+    return "\n".join(blocks)
 
 
 # --- Tagging tier (Sprint 7a, ADR-0011/0020) — read content, PROPOSE facets ----
@@ -1214,6 +1379,186 @@ class ClaudeProvider(AnswerProvider):
                 "fact_count": len(facts),
                 "truncated": truncated,
                 "salvaged": salvaged,
+            },
+        )
+
+    def propose_groups(
+        self,
+        convenio: ConvenioCandidate,
+        pages_text: str,
+        observed_group_labels: list[str],
+        api_key: str,
+        config: ProviderConfig,
+    ) -> GroupProposalResult:
+        """Read ONE convenio's text and propose its group tree (Sprint 7f,
+        ADR-0028). Read-only and inert: hr-backend persists every node as
+        `ai_agent`/`needs_review`, so a bad proposal costs a reviewer's click,
+        never a wrong answer.
+
+        Every structural invariant the DB enforces is ALSO enforced here, before
+        hr-backend ever sees the payload, so a malformed tree degrades to fewer
+        nodes rather than to a rejected batch: two levels only, no orphan
+        sub-areas, a sub-area must cite its differing value, and category ids are
+        validated against this convenio's closed set."""
+        import anthropic  # lazy — dep only needed at call time
+
+        client = anthropic.Anthropic(api_key=api_key, base_url=config.endpoint or None)
+        user_prompt = _build_propose_groups_prompt(convenio, pages_text, observed_group_labels)
+
+        started = time.monotonic()
+        resp = client.messages.create(
+            model=config.model,
+            max_tokens=PROPOSE_GROUPS_MAX_TOKENS,
+            system=PROPOSE_GROUPS_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+
+        raw_text = "".join(
+            block.text for block in resp.content if getattr(block, "type", "") == "text"
+        )
+        in_tok = getattr(resp.usage, "input_tokens", None) or 0
+        out_tok = getattr(resp.usage, "output_tokens", None) or 0
+        price_in, price_out = OCR_PRICING_PER_MTOK.get(config.model, _OCR_DEFAULT_PRICING)
+        cost_usd = round((in_tok / 1_000_000) * price_in + (out_tok / 1_000_000) * price_out, 6)
+
+        base_trace = {
+            "provider": config.provider,
+            "model": config.model,
+            "propose_ms": elapsed_ms,
+            "prompt_tokens": in_tok,
+            "completion_tokens": out_tok,
+            "cost_usd": cost_usd,
+        }
+
+        try:
+            envelope = _extract_json(raw_text)
+        except (json.JSONDecodeError, ValueError):
+            # A group tree is small and this call is non-streaming, so a parse
+            # failure is a genuine anomaly rather than the mid-array truncation
+            # `_salvage_facts` exists for. Return nothing: the convenio simply
+            # stays without a proposal, which is the safe state (the digit
+            # matcher is untouched until Phase 3) and is visibly retryable.
+            return GroupProposalResult(
+                groups=[],
+                trace_fragment={**base_trace, "parse_error": True, "group_count": 0},
+            )
+
+        raw_groups = envelope.get("groups") or []
+        if not isinstance(raw_groups, list):
+            raw_groups = []
+
+        valid_category_ids = {jc.id for jc in convenio.job_categories}
+
+        def label_key(value: object) -> str:
+            """A dedupe key only. Real normalization is hr-backend's
+            `GroupCodeNormalizer` — ONE implementation, and not the model's job
+            (see the system prompt). This just collapses the trivial variance
+            that would otherwise create two nodes for one printed label."""
+            return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+        # Pass 1 — the roots, which are what a sub-area's parent must resolve to.
+        root_keys: set[str] = set()
+        for node in raw_groups:
+            if isinstance(node, dict) and not node.get("parent_code_label"):
+                if str(node.get("code_label", "")).strip():
+                    root_keys.add(label_key(node.get("code_label")))
+
+        groups: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        dropped_orphan_areas = 0
+        dropped_unsupported_areas = 0
+        dropped_category_ids = 0
+        flagged_missing_excerpt = 0
+
+        for node in raw_groups:
+            if not isinstance(node, dict):
+                continue
+
+            code_label = str(node.get("code_label", "")).strip()
+            if not code_label:
+                continue  # a node with no printed label cannot be reviewed or matched
+
+            parent_raw = node.get("parent_code_label")
+            parent_label = str(parent_raw).strip() if parent_raw else ""
+            excerpt = str(node.get("source_excerpt", "")).strip()
+
+            uncertainty = node.get("uncertainty")
+            if not (isinstance(uncertainty, dict) and uncertainty.get("reason")):
+                uncertainty = None
+
+            if parent_label:
+                parent_key = label_key(parent_label)
+                if parent_key not in root_keys:
+                    # An area whose group was never proposed. Promoting it to a
+                    # root would invent a group the model didn't claim exists.
+                    dropped_orphan_areas += 1
+                    continue
+                if parent_key == label_key(code_label):
+                    dropped_orphan_areas += 1  # self-parent
+                    continue
+                if not excerpt:
+                    # THE granularity guard, enforced and not merely requested: a
+                    # split with no citation is the unsupported inference this
+                    # sprint exists to prevent, and an unnecessary split makes
+                    # Phase 3 demand a distinction the convenio never made.
+                    dropped_unsupported_areas += 1
+                    continue
+            elif not excerpt:
+                # A root with no citation is still reviewable (the reviewer can
+                # find it), so keep it — but never let it look confident.
+                flagged_missing_excerpt += 1
+                uncertainty = uncertainty or {
+                    "field": "label",
+                    "reason": "El modelo no citó el texto que respalda este grupo.",
+                }
+
+            key = (label_key(code_label), label_key(parent_label))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            category_ids: list[int] = []
+            for cid in node.get("job_category_ids") or []:
+                if isinstance(cid, int) and cid in valid_category_ids:
+                    if cid not in category_ids:
+                        category_ids.append(cid)
+                else:
+                    # Closed-set validation (ADR-0011 by construction): a
+                    # hallucinated or foreign-convenio category id can NEVER
+                    # reach hr-backend, and the AI never mints vocabulary.
+                    dropped_category_ids += 1
+
+            confidence = node.get("confidence")
+            if not isinstance(confidence, (int, float)):
+                confidence = None
+
+            groups.append(
+                {
+                    "code_label": code_label,
+                    "parent_code_label": parent_label or None,
+                    "job_category_ids": category_ids,
+                    "source_excerpt": excerpt or None,
+                    "source_locator": str(node.get("source_locator", "")).strip() or None,
+                    "confidence": confidence,
+                    "uncertainty": uncertainty,
+                }
+            )
+
+        # Two levels, structurally: a root has no parent and every survivor's
+        # parent is a root, so nothing deeper than group › area can exist.
+        return GroupProposalResult(
+            groups=groups,
+            trace_fragment={
+                **base_trace,
+                "group_count": sum(1 for g in groups if g["parent_code_label"] is None),
+                "sub_area_count": sum(1 for g in groups if g["parent_code_label"] is not None),
+                "dropped_orphan_areas": dropped_orphan_areas,
+                "dropped_unsupported_areas": dropped_unsupported_areas,
+                "dropped_category_ids": dropped_category_ids,
+                "flagged_missing_excerpt": flagged_missing_excerpt,
+                "text_truncated": len((pages_text or "").strip()) > PROPOSE_GROUPS_TEXT_CAP,
+                "notes": str(envelope.get("notes", "")).strip() or None,
             },
         )
 
