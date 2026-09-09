@@ -302,6 +302,29 @@ class SegmentFactsRequest(BaseModel):
     provider_config: ProviderConfigBody
 
 
+class ProposeGroupsRequest(BaseModel):
+    """Group-structure proposal for ONE convenio (Sprint 7f, ADR-0028).
+
+    hr-backend passes the convenio's OWN text (its `document_pages`, concatenated
+    — the group structure lives in one article but which one varies, so the model
+    gets the whole convenio), its EXISTING job categories as a closed set with
+    `group_code` as evidence only, and the `group_label` strings its verified
+    reference facts already use as a checklist.
+
+    hr-ai READS and PROPOSES; it writes NOTHING and never migrates (ADR-0007).
+    The proposal is INERT: hr-backend persists every node as
+    `ai_agent`/`needs_review`, and no node is comparable by the answer path until
+    a human approves it. The AI never mints a category (ADR-0011) and never
+    normalizes a code — `GroupCodeNormalizer` in hr-backend owns that, so
+    normalization has exactly one implementation."""
+
+    convenio: ConvenioCandidateBody
+    pages_text: str
+    observed_group_labels: list[str] = []
+    provider_api_key: str
+    provider_config: ProviderConfigBody
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Liveness probe."""
@@ -836,3 +859,70 @@ def segment_facts(req: SegmentFactsRequest) -> JSONResponse:
         return JSONResponse({"facts": result.facts, "trace_fragment": result.trace_fragment})
     except Exception as exc:  # noqa: BLE001 - never echo the body (it carries the key)
         return JSONResponse({"facts": [], "error": "provider_error", "detail": str(exc)}, status_code=200)
+
+
+@app.post("/propose-groups", dependencies=[Depends(require_internal_token)])
+def propose_groups(req: ProposeGroupsRequest) -> JSONResponse:
+    """Read ONE convenio's text and PROPOSE its group structure — the groups and,
+    only where the text prices them differently, the areas within a group
+    (Sprint 7f, ADR-0028). hr-ai READS and PROPOSES; it writes NOTHING and never
+    migrates (ADR-0007).
+
+    This exists because the answer path currently matches a group by finding a
+    bare digit in a free-text label, which cannot express "área 5 of Grupo 2" and
+    so mis-scopes it. Phase 3 replaces that with an exact comparison on a group
+    id — and an id is only trustworthy if a human approved the structure behind
+    it. So this endpoint runs ONCE per convenio, ahead of time, and its output is
+    inert: hr-backend persists each node as `ai_agent`/`needs_review`, and NO AI
+    RUNS AT ANSWER TIME.
+
+    The load-bearing prompt detail is GRANULARITY: a sub-area is proposed only
+    where the text assigns the slices different values, each with the justifying
+    excerpt. An unnecessary split is not a harmless extra row — it makes the
+    matcher demand a distinction the convenio never made, so the eval gates on
+    under-splits and the provider drops any uncited split.
+
+    On a provider failure this returns 200 with `{ "groups": [], "error": ... }`
+    (the key is never echoed) so hr-backend leaves the convenio without a
+    proposal — the safe state, since the existing matcher is untouched until a
+    human approves a tree.
+    """
+    from .providers import (
+        ConvenioCandidate,
+        JobCategoryCandidate,
+        ProviderConfig,
+        get_provider,
+    )
+
+    try:
+        provider = get_provider(req.provider_config.provider)
+        config = ProviderConfig(
+            provider=req.provider_config.provider,
+            model=req.provider_config.model,
+            endpoint=req.provider_config.endpoint,
+        )
+        c = req.convenio
+        convenio = ConvenioCandidate(
+            id=c.id,
+            name=c.name,
+            numero=c.numero,
+            aliases=c.aliases,
+            territory_name=c.territory_name,
+            territory_aliases=c.territory_aliases,
+            sector_name=c.sector_name,
+            sector_aliases=c.sector_aliases,
+            job_categories=[
+                JobCategoryCandidate(id=jc.id, name=jc.name, group_code=jc.group_code)
+                for jc in c.job_categories
+            ],
+        )
+        result = provider.propose_groups(
+            convenio,
+            req.pages_text,
+            req.observed_group_labels,
+            req.provider_api_key,
+            config,
+        )
+        return JSONResponse({"groups": result.groups, "trace_fragment": result.trace_fragment})
+    except Exception as exc:  # noqa: BLE001 - never echo the body (it carries the key)
+        return JSONResponse({"groups": [], "error": "provider_error", "detail": str(exc)}, status_code=200)

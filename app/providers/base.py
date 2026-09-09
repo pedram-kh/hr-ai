@@ -200,6 +200,44 @@ class SegmentedFactsResult:
 
 
 @dataclass
+class GroupProposalResult:
+    """The group STRUCTURE proposed for ONE convenio (Sprint 7f, ADR-0028).
+
+    A strict, inert proposer, exactly like `SegmentedFactsResult`: hr-backend
+    persists every node as `ai_agent`/`needs_review`, nothing is comparable by
+    the answer path until a human approves it, and hr-ai writes NOTHING.
+
+    `groups` is a flat list of nodes, each:
+      `code_label`      the group AS PRINTED ("Grupo 2", "Grupo I") — hr-backend
+                        derives `code_normalized` with `GroupCodeNormalizer`, so
+                        normalization has exactly ONE implementation and it is
+                        not the model's job.
+      `parent_code_label` null for a group, the parent's `code_label` for a
+                        SUB-AREA. Names rather than ids because nothing exists
+                        yet — hr-backend resolves the tree on persist.
+      `source_excerpt`  the convenio line that justifies this node. REQUIRED for
+                        a sub-area: a slice of a group that no text supports is
+                        precisely the inference this sprint routes to a human.
+      `source_locator`  where it was read (e.g. "p.12").
+      `job_category_ids` EXISTING category ids only, validated against the closed
+                        set (ADR-0011 — the category vocabulary is never minted).
+      `confidence`, `uncertainty` ({field, reason} or null — flag, don't guess).
+
+    ⚠ THE GRANULARITY RULE, which is the whole reason this endpoint is not a
+    generic "list the groups" call: A SUB-AREA IS PROPOSED ONLY WHERE THE TEXT
+    ASSIGNS THE SLICES DIFFERENT VALUES. Hostelería Navarra prices `área 5` of
+    Grupo 2 at 90/75/60 días and `resto áreas` at 60/45/30, so those two
+    sub-areas exist. A convenio that merely mentions áreas without pricing them
+    differently gets ONE node for the group — an unnecessary split would make the
+    Phase 3 matcher demand a distinction the convenio never made, turning a
+    correct answer into an escalation.
+    """
+
+    groups: list[dict] = field(default_factory=list)
+    trace_fragment: dict = field(default_factory=dict)
+
+
+@dataclass
 class OcrPageResult:
     """One page's OCR transcription (Sprint 7e, ADR-0026) — the vision call's
     return shape. hr-ai READS the page image and RETURNS this; it writes NOTHING
@@ -323,6 +361,40 @@ class AnswerProvider(ABC):
         inside `value`/`raw_values`). A strict, inert proposer — it returns
         suggestions, writes nothing, proposes no validity/authority, and flags
         uncertainty rather than guessing scope."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def propose_groups(
+        self,
+        convenio: ConvenioCandidate,
+        pages_text: str,
+        observed_group_labels: list[str],
+        api_key: str,
+        config: ProviderConfig,
+    ) -> GroupProposalResult:
+        """Read ONE convenio's own text and propose its GROUP STRUCTURE (Sprint
+        7f, ADR-0028) — the vocabulary the answer path will later compare
+        exactly, replacing a bare-digit regex.
+
+        Three inputs, with deliberately unequal authority:
+          `pages_text`  the convenio's own text — THE ONLY SOURCE OF TRUTH. Every
+                        node must carry an excerpt from it.
+          `convenio.job_categories` existing categories, with `group_code` as
+                        EVIDENCE ONLY, never as truth: across the real corpus 72
+                        of 94 rows hold nothing to normalize and 9 of the
+                        remaining 22 hold a salary figure or a year. A code that
+                        the text contradicts is ignored; the categories
+                        themselves are a CLOSED set and are never minted.
+          `observed_group_labels` the `group_label` strings human-verified
+                        reference facts already use for this convenio. These are
+                        a CHECKLIST, not a source: a structure that cannot
+                        express a label a verified fact already uses would leave
+                        that fact unbindable and permanently escalating.
+
+        A sub-area is proposed ONLY where the text assigns the slices different
+        values (see `GroupProposalResult`). A strict, inert proposer: it returns
+        suggestions, writes nothing, mints no category, normalizes no code, and
+        flags uncertainty rather than guessing."""
         raise NotImplementedError
 
     @abstractmethod
