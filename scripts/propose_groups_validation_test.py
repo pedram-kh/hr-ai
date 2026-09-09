@@ -200,7 +200,15 @@ check("the group survives", node(groups, "Grupo 2") is not None)
 check("the uncited area does not", node(groups, "área 3", "Grupo 2") is None)
 check("counted as unsupported", trace["dropped_unsupported_areas"] == 1, str(trace))
 
-print("\n[4] An ORPHAN area is dropped, not promoted to a group")
+# Rewritten after the first live run on Hostelería Navarra, which is where this
+# behaviour was decided rather than guessed. The model read article 19 correctly
+# and said so in its notes, but returned Grupo 2's two areas WITHOUT Grupo 2 —
+# so both areas were orphans, both were dropped, and the result was exactly the
+# under-split the eval gates on. A cited orphan now gets its parent
+# reconstructed: the label comes verbatim from the child's `parent_code_label`,
+# so nothing is invented, and the node is flagged so the reviewer knows it came
+# from its children rather than from a line of its own.
+print("\n[4] A CITED orphan area reconstructs its parent instead of losing the split")
 groups, trace = run(
     json.dumps(
         {
@@ -223,9 +231,45 @@ groups, trace = run(
         }
     )
 )
+check("the split survives", len(groups) == 3, str([g["code_label"] for g in groups]))
+check("the missing parent was reconstructed", node(groups, "Grupo 7") is not None)
+check(
+    "reconstructed with the label its child cited, not an invented one",
+    (node(groups, "Grupo 7") or {}).get("parent_code_label") is None,
+)
+check("the area stays an AREA under it, not a second root", node(groups, "área 5", "Grupo 7") is not None)
+check("and it is NOT also emitted as a root", node(groups, "área 5") is None)
+check(
+    "the reconstruction is flagged for the reviewer",
+    "reconstruido" in ((node(groups, "Grupo 7") or {}).get("uncertainty") or {}).get("reason", ""),
+)
+check("counted", trace["synthesised_parents"] == 1, str(trace))
+
+print("\n[4b] An UNCITED orphan area is still dropped, and conjures nothing")
+groups, trace = run(
+    json.dumps(
+        {
+            "groups": [
+                {
+                    "code_label": "Grupo 1",
+                    "parent_code_label": None,
+                    "job_category_ids": [],
+                    "source_excerpt": "Grupo 1",
+                    "source_locator": "p.1",
+                },
+                {
+                    "code_label": "área 5",
+                    "parent_code_label": "Grupo 7",  # never proposed, and uncited
+                    "job_category_ids": [],
+                    "source_excerpt": "",
+                },
+            ]
+        }
+    )
+)
 check("only the real group remains", len(groups) == 1 and groups[0]["code_label"] == "Grupo 1")
-check("the orphan was NOT promoted to a root", node(groups, "área 5") is None)
-check("counted as orphan", trace["dropped_orphan_areas"] == 1, str(trace))
+check("no group was conjured for it", node(groups, "Grupo 7") is None)
+check("nothing was synthesised", trace["synthesised_parents"] == 0, str(trace))
 
 print("\n[5] Depth stays at 2 — an area under an area cannot exist")
 groups, trace = run(

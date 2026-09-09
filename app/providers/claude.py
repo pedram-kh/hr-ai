@@ -365,6 +365,12 @@ PROPOSE_GROUPS_SYSTEM_PROMPT = (
     "identificador.\n"
     "Un nodo es un ÁREA cuando `parent_code_label` es la etiqueta de su grupo; es un GRUPO cuando "
     "`parent_code_label` es null.\n"
+    "SIEMPRE emite el grupo padre COMO NODO PROPIO, además de sus áreas. Un grupo dividido no "
+    "queda representado por sus áreas: sigue siendo un grupo al que un dato o una persona puede "
+    "referirse en conjunto, y su `parent_code_label` debe aparecer literalmente como el "
+    "`code_label` de un nodo raíz de tu propia lista. Si divides el Grupo 2 en 'área 5' y "
+    "'resto áreas', devuelve TRES nodos: 'Grupo 2', 'área 5' (padre 'Grupo 2') y 'resto áreas' "
+    "(padre 'Grupo 2').\n"
     "NO propongas un nodo compuesto: si el convenio dice 'Grupos 1 y 2', eso NO es un grupo "
     "llamado 'Grupos 1 y 2' — son dos grupos, 'Grupo 1' y 'Grupo 2'. Que un mismo artículo les "
     "dé el mismo valor se resolverá después vinculando ese dato a los dos grupos.\n"
@@ -1464,6 +1470,75 @@ class ClaudeProvider(AnswerProvider):
                 if str(node.get("code_label", "")).strip():
                     root_keys.add(label_key(node.get("code_label")))
 
+        # Pass 1b — SYNTHESISE a missing parent rather than dropping its areas.
+        #
+        # Found on the first live run, against Hostelería Navarra. The model read
+        # article 19 correctly and said so in its notes, but represented the split
+        # group by its two areas ALONE, without also emitting the group itself —
+        # so both areas were orphans and both were dropped, leaving exactly the
+        # UNDER-SPLIT the eval gates on. Dropping a cited split is the worst
+        # available outcome: it is how someone entitled to 90 días gets told 60.
+        #
+        # Synthesising the parent invents nothing. Its printed label is already
+        # given, verbatim, by the child's `parent_code_label`; the child carries
+        # the excerpt that proves the group is split; and the node lands
+        # `needs_review` like every other, flagged so the reviewer sees that this
+        # one came from its children rather than from a line of its own.
+        synthesised_parents = 0
+        # Labels the model itself used for AREAS. A parent naming one of these is
+        # a THIRD level, not a missing group, and synthesising it would defeat the
+        # two-level limit by turning one area into both an area and a root.
+        area_keys = {
+            label_key(n.get("code_label"))
+            for n in raw_groups
+            if isinstance(n, dict) and n.get("parent_code_label") and str(n.get("code_label", "")).strip()
+        }
+        orphan_parents: dict[str, str] = {}
+        for node in raw_groups:
+            if not isinstance(node, dict):
+                continue
+            parent_raw = node.get("parent_code_label")
+            parent_label = str(parent_raw).strip() if parent_raw else ""
+            if not parent_label or not str(node.get("code_label", "")).strip():
+                continue
+            key = label_key(parent_label)
+            if key in root_keys or key in area_keys:
+                continue
+            # Only for a CITED area — an uncited split is refused below, and a
+            # refused split must not conjure a group on the way out.
+            if str(node.get("source_excerpt", "")).strip():
+                orphan_parents.setdefault(key, parent_label)
+
+        for key, parent_label in orphan_parents.items():
+            child = next(
+                (
+                    n
+                    for n in raw_groups
+                    if isinstance(n, dict) and label_key(n.get("parent_code_label")) == key
+                ),
+                None,
+            )
+            raw_groups.append(
+                {
+                    "code_label": parent_label,
+                    "parent_code_label": None,
+                    "job_category_ids": [],
+                    "source_excerpt": (child or {}).get("source_excerpt"),
+                    "source_locator": (child or {}).get("source_locator"),
+                    "confidence": (child or {}).get("confidence"),
+                    "uncertainty": {
+                        "field": "code_label",
+                        "reason": (
+                            "Nodo reconstruido: el modelo propuso sus áreas pero no el grupo "
+                            "en sí. La etiqueta es la que citan sus áreas; confírmala contra "
+                            "el texto del convenio."
+                        ),
+                    },
+                }
+            )
+            root_keys.add(key)
+            synthesised_parents += 1
+
         groups: list[dict] = []
         seen: set[tuple[str, str]] = set()
         dropped_orphan_areas = 0
@@ -1554,6 +1629,7 @@ class ClaudeProvider(AnswerProvider):
                 "group_count": sum(1 for g in groups if g["parent_code_label"] is None),
                 "sub_area_count": sum(1 for g in groups if g["parent_code_label"] is not None),
                 "dropped_orphan_areas": dropped_orphan_areas,
+                "synthesised_parents": synthesised_parents,
                 "dropped_unsupported_areas": dropped_unsupported_areas,
                 "dropped_category_ids": dropped_category_ids,
                 "flagged_missing_excerpt": flagged_missing_excerpt,
