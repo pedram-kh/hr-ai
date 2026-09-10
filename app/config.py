@@ -50,6 +50,14 @@ class Settings(BaseSettings):
     embed_model: str = "BGE-M3"
     embed_model_hf: str = "BAAI/bge-m3"
     embed_dim: int = 1024
+    # Sprint 8, Step 5 (plan.md §1.3, build-authorization additions): the cap
+    # on `/embed-batch`'s `texts` list. The nightly question-cluster job
+    # (hr-backend) batches its OWN caller-side loop at this size — hr-ai's
+    # `embed_texts()` already internally batches at `batch_size=16`
+    # (embeddings.py), this is a REQUEST-size cap, not a model batch size, to
+    # keep one HTTP call bounded regardless of how many distinct questions a
+    # given night's corpus has.
+    embed_batch_max_texts: int = 256
 
     # --- Chunking (Sprint 2a ADR-0013; Sprint 2c ADR-0017) ---
     # ARTICLE-BOUNDARY chunking (Sprint 2c): one chunk per article, NO
