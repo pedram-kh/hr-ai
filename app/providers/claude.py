@@ -813,6 +813,11 @@ OCR_PRICING_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-sonnet-4-5": (3.00, 15.00),
     "claude-sonnet-5": (2.00, 10.00),
     "claude-opus-5": (5.00, 25.00),
+    # Added Sprint 7g Item 1 (ADR-0029) — the ROUTER_MODEL, now also used for the
+    # escalation-explanation "Resumen IA" paragraph (hr-backend's
+    # EscalationExplanationService, via this SAME /synthesise endpoint). Checked
+    # against Anthropic's published rate card, 2026-09-10: $1.00 / $5.00 per MTok.
+    "claude-haiku-4-5": (1.00, 5.00),
 }
 _OCR_DEFAULT_PRICING = (3.00, 15.00)
 
@@ -918,6 +923,18 @@ class ClaudeProvider(AnswerProvider):
         top_score = max((c.score for c in chunks), default=0.0)
         grounded = len(citations) >= 1 and bool(answer)
 
+        # Sprint 7g Item 1 (ADR-0029): cost_usd, same computation/table as the
+        # other metered calls (propose-groups, ocr-page) — added here because
+        # the escalation-explanation "Resumen IA" paragraph reuses THIS
+        # endpoint with the cheap ROUTER_MODEL and the sprint spec requires
+        # "cost logged per card". Purely additive: every existing caller of
+        # /synthesise (the employee answer path) already ignores unknown
+        # trace_fragment keys.
+        in_tok = getattr(resp.usage, "input_tokens", None) or 0
+        out_tok = getattr(resp.usage, "output_tokens", None) or 0
+        price_in, price_out = OCR_PRICING_PER_MTOK.get(config.model, _OCR_DEFAULT_PRICING)
+        cost_usd = round((in_tok / 1_000_000) * price_in + (out_tok / 1_000_000) * price_out, 6)
+
         # Order authority_used by precedence (convenio first, then baseline) for a
         # stable, readable audit value.
         authority_ordered = sorted(authority_used, key=lambda a: _AUTHORITY_RANK.get(a, 99))
@@ -935,8 +952,9 @@ class ClaudeProvider(AnswerProvider):
             trace_fragment={
                 "provider": config.provider,
                 "model": config.model,
-                "prompt_tokens": getattr(resp.usage, "input_tokens", None),
-                "completion_tokens": getattr(resp.usage, "output_tokens", None),
+                "prompt_tokens": in_tok,
+                "completion_tokens": out_tok,
+                "cost_usd": cost_usd,
                 "synthesis_ms": elapsed_ms,
                 "authority_used": authority_ordered,
             },
