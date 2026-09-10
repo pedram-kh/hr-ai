@@ -67,6 +67,24 @@ class SynthesisResult:
 
 
 @dataclass
+class ExplainResult:
+    """What a provider returns for one `explain` call (Sprint 7g fast-follow,
+    ADR-0029). This is NOT a `SynthesisResult`: there are no citations, no
+    grounding signal, no confidence — `/explain` restates a small, already-
+    verified set of facts in plain prose for an HR reader, and carries none of
+    `/synthesise`'s citation-contract baggage (`[Fuente N]` markers, the
+    convenio-vs-national-law precedence rule, an abstention protocol). Reusing
+    `SynthesisResult`'s shape would invite exactly the confusion this fast-
+    follow exists to remove.
+
+    `trace_fragment` carries `cost_usd`/model/token counts for the caller to
+    log, same convention as every other metered call."""
+
+    answer: str
+    trace_fragment: dict = field(default_factory=dict)
+
+
+@dataclass
 class GroundChunk:
     """One CITED chunk passed to the per-claim grounding check (Sprint 2b-2, §5).
 
@@ -300,6 +318,28 @@ class AnswerProvider(ABC):
         """Compose a cited answer grounded ONLY in `chunks`, honouring the
         convenio-over-baseline precedence rule. `api_key` is used for this one
         call and never persisted."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def explain(
+        self,
+        instruction: str,
+        facts_text: str,
+        api_key: str,
+        config: ProviderConfig,
+    ) -> ExplainResult:
+        """Restate `facts_text` (an already-verified, HR-authored list of
+        facts — never a retrieved document) as a short plain-prose paragraph,
+        per `instruction` (Sprint 7g fast-follow, ADR-0029).
+
+        Deliberately NOT `synthesise()`: no citation markers, no quoting of
+        the facts verbatim, no content beyond what `facts_text` states. This
+        exists because reusing `synthesise()`'s citation-contract prompt for
+        this call was found live to make the model habitually append
+        `[Fuente N]`-style markers to every sentence — correctly rejected every
+        time by hr-backend's no-new-claims guard, so the AI paragraph never
+        survived in practice. `api_key` is used for this one call and never
+        persisted (same discipline as every other provider call)."""
         raise NotImplementedError
 
     @abstractmethod

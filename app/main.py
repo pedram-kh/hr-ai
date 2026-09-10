@@ -32,6 +32,13 @@ retrieval substrate:
                (default Claude). The API key arrives PER CALL from hr-backend and
                is NEVER stored, logged, or persisted here. hr-backend owns the
                answer-or-escalate decision; this endpoint only synthesises.
+- `/explain` — Sprint 7g fast-follow (ADR-0029): restate a small, already-
+               verified list of HR facts (never a retrieved document) as plain
+               prose, with NO citation contract — a deliberately separate
+               endpoint from `/synthesise` because reusing that one's citation-
+               contract prompt for a plain restatement made the model
+               habitually append `[Fuente N]` markers, which the caller's
+               no-new-claims guard correctly rejected every time in practice.
 
 hr-ai still NEVER migrates and writes NO table other than `document_chunks`.
 """
@@ -197,6 +204,18 @@ class SynthesiseRequest(BaseModel):
     chunks: list[SynthesisChunk]
     # The decrypted answer-model key, owned by hr-backend, passed in the BODY
     # (never a header) per call. Used for this one request only; never persisted.
+    provider_api_key: str
+    provider_config: ProviderConfigBody
+
+
+class ExplainRequest(BaseModel):
+    """Sprint 7g fast-follow (ADR-0029). Deliberately NOT a `SynthesiseRequest`:
+    `facts_text` is a small block of already-verified, HR-authored facts (never
+    a retrieved document/chunk), and there is no citation contract, no
+    grounding signal, no confidence score to compute — see `ExplainResult`."""
+
+    instruction: str
+    facts_text: str
     provider_api_key: str
     provider_config: ProviderConfigBody
 
@@ -675,6 +694,41 @@ def synthesise(req: SynthesiseRequest) -> JSONResponse:
             }
         )
     except Exception as exc:  # noqa: BLE001 - provider/parse failure → escalation
+        # NEVER include the request body (it carries the key). Only the message.
+        return JSONResponse({"error": "provider_error", "detail": str(exc)}, status_code=200)
+
+
+@app.post("/explain", dependencies=[Depends(require_internal_token)])
+def explain(req: ExplainRequest) -> JSONResponse:
+    """Restate a small, already-verified set of HR facts as plain prose
+    (Sprint 7g fast-follow, ADR-0029).
+
+    NOT `/synthesise`: `facts_text` is not a retrieved document, there are no
+    citations, no grounding signal, no confidence, and the prompt
+    (`EXPLAIN_SYSTEM_PROMPT`) forbids citation markers and verbatim quoting
+    entirely. Exists because reusing `/synthesise` for this call was found
+    live to make the model habitually append `[Fuente N]` markers, which
+    hr-backend's no-new-claims guard then rejected every time — the AI
+    paragraph never survived in practice. The guard itself is UNCHANGED and
+    correct; this fixes the prompt that fed it, not the check.
+
+    Same failure discipline as `/synthesise`: on a provider/parse failure this
+    returns 200 with `{ "error": "provider_error", ... }` (the key is never
+    echoed) so hr-backend falls back to its deterministic sentences — never a
+    thrown error, never a guess.
+    """
+    from .providers import ExplainResult, ProviderConfig, get_provider
+
+    try:
+        provider = get_provider(req.provider_config.provider)
+        config = ProviderConfig(
+            provider=req.provider_config.provider,
+            model=req.provider_config.model,
+            endpoint=req.provider_config.endpoint,
+        )
+        result: ExplainResult = provider.explain(req.instruction, req.facts_text, req.provider_api_key, config)
+        return JSONResponse({"answer": result.answer, "trace_fragment": result.trace_fragment})
+    except Exception as exc:  # noqa: BLE001 - provider/parse failure → fallback
         # NEVER include the request body (it carries the key). Only the message.
         return JSONResponse({"error": "provider_error", "detail": str(exc)}, status_code=200)
 

@@ -24,6 +24,7 @@ from .base import (
     AnswerProvider,
     ChunkInput,
     ConvenioCandidate,
+    ExplainResult,
     GroundChunk,
     GroundingResult,
     GroupProposalResult,
@@ -813,15 +814,47 @@ OCR_PRICING_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-sonnet-4-5": (3.00, 15.00),
     "claude-sonnet-5": (2.00, 10.00),
     "claude-opus-5": (5.00, 25.00),
-    # Added Sprint 7g Item 1 (ADR-0029) — the ROUTER_MODEL, now also used for the
+    # Added Sprint 7g Item 1 (ADR-0029) — the ROUTER_MODEL, also used for the
     # escalation-explanation "Resumen IA" paragraph (hr-backend's
-    # EscalationExplanationService, via this SAME /synthesise endpoint). Checked
+    # EscalationExplanationService, via `/explain` as of the Sprint 7g
+    # fast-follow below — originally `/synthesise`, moved off it). Checked
     # against Anthropic's published rate card, 2026-09-10: $1.00 / $5.00 per MTok.
     "claude-haiku-4-5": (1.00, 5.00),
 }
 _OCR_DEFAULT_PRICING = (3.00, 15.00)
 
 OCR_MAX_TOKENS = 4096
+
+# Sprint 7g fast-follow (ADR-0029). EscalationExplanationService's "Resumen IA"
+# paragraph originally reused `/synthesise` (SYSTEM_PROMPT, above) with the
+# rendered facts posing as a single "chunk". Found live on staging: the model
+# habitually appended a `[Fuente 1]`-style marker to EVERY sentence — an
+# ingrained habit from that prompt's citation contract — which hr-backend's
+# no-new-claims guard correctly rejected every time (3/3 live attempts across
+# two reasons), so the AI paragraph never survived in practice. This is a
+# DEDICATED prompt for a plain restatement task with none of that contract:
+# no citation markers, no verbatim quoting, nothing beyond the supplied facts.
+EXPLAIN_SYSTEM_PROMPT = (
+    "Eres un/a redactor/a interno/a de Recursos Humanos. Tu ÚNICA tarea es "
+    "reescribir una lista de hechos, ya verificados por otro sistema, como UN "
+    "PÁRRAFO breve (3-5 frases) de prosa clara en español, dirigido a un/a "
+    "compañero/a de RR.HH. que va a atender el caso.\n\n"
+    "REGLAS ABSOLUTAS:\n"
+    "1. Usa ÚNICAMENTE el contenido de los HECHOS proporcionados. No añadas "
+    "ningún dato, cifra, nombre, fecha o afirmación que no esté literalmente "
+    "en esos hechos. No completes huecos con tu conocimiento general.\n"
+    "2. PROHIBIDO cualquier marcador o numeración de cita — nunca escribas "
+    "'[Fuente N]', '(fuente)', 'según la fuente', ni ningún otro indicador de "
+    "procedencia. Esta NO es una respuesta con citas: es la reescritura en "
+    "prosa de una lista de hechos que ya te doy completa.\n"
+    "3. PROHIBIDO usar comillas para citar los hechos literalmente. Reescribe "
+    "con tus propias palabras, en prosa normal, sin comillas de ningún tipo.\n"
+    "4. Un solo párrafo, sin markdown, sin listas, sin títulos, sin saludos.\n"
+    "5. Responde en español.\n\n"
+    "FORMATO DE SALIDA: devuelve EXCLUSIVAMENTE un objeto JSON válido, sin "
+    "texto alrededor ni backticks, con esta forma exacta: "
+    '{"answer": "<párrafo>"}'
+)
 
 
 class ClaudeProvider(AnswerProvider):
@@ -959,6 +992,61 @@ class ClaudeProvider(AnswerProvider):
                 "authority_used": authority_ordered,
             },
         )
+
+    def explain(
+        self,
+        instruction: str,
+        facts_text: str,
+        api_key: str,
+        config: ProviderConfig,
+    ) -> ExplainResult:
+        """Plain restatement of `facts_text` (Sprint 7g fast-follow, ADR-0029).
+        Uses `EXPLAIN_SYSTEM_PROMPT` — a dedicated prompt with NO citation
+        contract — never `SYSTEM_PROMPT` (that one is for `/synthesise`'s
+        cited-answer task and is exactly what caused the `[Fuente N]` habit
+        this call exists to avoid)."""
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=api_key, base_url=config.endpoint or None)
+        user_prompt = f"Instrucción: {instruction}\n\nHECHOS:\n{facts_text}"
+
+        started = time.monotonic()
+        resp = client.messages.create(
+            model=config.model,
+            max_tokens=512,
+            system=EXPLAIN_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+
+        raw_text = "".join(
+            block.text for block in resp.content if getattr(block, "type", None) == "text"
+        )
+
+        in_tok = getattr(resp.usage, "input_tokens", None) or 0
+        out_tok = getattr(resp.usage, "output_tokens", None) or 0
+        price_in, price_out = OCR_PRICING_PER_MTOK.get(config.model, _OCR_DEFAULT_PRICING)
+        cost_usd = round((in_tok / 1_000_000) * price_in + (out_tok / 1_000_000) * price_out, 6)
+        trace_fragment = {
+            "provider": config.provider,
+            "model": config.model,
+            "explain_ms": elapsed_ms,
+            "prompt_tokens": in_tok,
+            "completion_tokens": out_tok,
+            "cost_usd": cost_usd,
+        }
+
+        try:
+            envelope = _extract_json(raw_text)
+        except (json.JSONDecodeError, ValueError):
+            # Unparseable output → no paragraph. hr-backend's caller treats an
+            # empty answer exactly like a failed no-new-claims check (falls
+            # back to the deterministic sentences) — never guesses.
+            return ExplainResult(answer="", trace_fragment={**trace_fragment, "parse_error": True})
+
+        answer = str(envelope.get("answer", "")).strip()
+
+        return ExplainResult(answer=answer, trace_fragment=trace_fragment)
 
     def classify(
         self,
