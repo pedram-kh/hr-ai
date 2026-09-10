@@ -95,6 +95,15 @@ class SalaryExtractRequest(BaseModel):
     document_uuid: str
 
 
+class EmbedBatchRequest(BaseModel):
+    """Sprint 8, Step 5 (plan.md §1.3/§4.2) — one new hr-ai endpoint, and the
+    ONLY hr-ai change in the whole sprint. `texts` is capped (plan.md
+    build-authorization additions) so a caller can never turn this into an
+    unbounded batch job against the model process."""
+
+    texts: list[str]
+
+
 class ReadStructuredRequest(BaseModel):
     """Non-salary docx/xlsx content read (Sprint 7b-1, ADR-0021). Reads-and-
     returns ONLY — never writes the DB, never migrates (ADR-0007). A
@@ -494,6 +503,40 @@ def extract_salary(req: SalaryExtractRequest) -> JSONResponse:
         return JSONResponse(result)
     except Exception as exc:  # noqa: BLE001 - surface parse/storage failure
         return JSONResponse({"status": "error", "detail": str(exc)}, status_code=502)
+
+
+@app.post("/embed-batch", dependencies=[Depends(require_internal_token)])
+def embed_batch(req: EmbedBatchRequest) -> JSONResponse:
+    """Sprint 8, Step 5 (plan.md §1.3/§4.2, ADR-0030) — the ONLY hr-ai change
+    in the whole sprint. A thin wrapper around the already-existing
+    `embed_texts(list[str])` (embeddings.py) — read-only, no DB access at
+    all (not even `document_chunks`), no new model, no migration. Exists
+    because neither `/retrieve` nor `/compare-scope` ever return bare
+    vectors — both structurally require a `document_chunks` scope/candidate
+    context (plan.md §1.3's finding) — and the nightly question-cluster job
+    (hr-backend) needs raw vectors for questions that were never chunks.
+
+    Capped at `settings.embed_batch_max_texts` so one HTTP call can never
+    turn into an unbounded batch job against the model process; the caller
+    (hr-backend's `questions:cluster`) is responsible for chunking a larger
+    night's distinct-question set into calls of this size.
+    """
+    if len(req.texts) > settings.embed_batch_max_texts:
+        return JSONResponse(
+            {
+                "error": "batch_too_large",
+                "detail": f"texts has {len(req.texts)} entries, max is {settings.embed_batch_max_texts}",
+            },
+            status_code=422,
+        )
+
+    from .embeddings import embed_texts
+
+    try:
+        vectors = embed_texts(req.texts)
+        return JSONResponse({"embeddings": vectors})
+    except Exception as exc:  # noqa: BLE001 - surface model failure
+        return JSONResponse({"error": "provider_error", "detail": str(exc)}, status_code=502)
 
 
 @app.post("/read-structured", dependencies=[Depends(require_internal_token)])
