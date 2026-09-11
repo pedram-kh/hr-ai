@@ -73,6 +73,101 @@ _DISP = re.compile(
 _PARA = re.compile(r"\n\s*\n")
 _SENT = re.compile(r"(?<=[.;:])\s+")
 
+# Sprint 10a F1 — a table-of-contents / index entry: a dot leader (6+ dots) run
+# followed by a page number. The Estatuto's front matter (pages 1-11) is 32 such
+# chunks, 25 of which open with `Artículo N.` and are therefore INDISTINGUISHABLE
+# from a real article chunk by their first line — e.g.
+#   "Artículo 14. Periodo de prueba.................................. 40"
+# They carry the topical keywords of the article and none of its substance. On
+# the normal path real convenio chunks out-compete them; on Sprint 10a's
+# national-law-ONLY fallback path there is no convenio side, so they become
+# first-class decoys for exactly the questions the fallback exists to answer.
+# NOT end-of-line anchored, deliberately. The Estatuto's index frequently packs
+# several entries onto one extracted line —
+#   "Artículo 45. Causas y efectos de la suspensión.......... 95 Artículo 46. …"
+# — so an `…$` anchor matches none of them. Worse than merely missing a chunk:
+# an accepted TOC anchor advances the monotonic counter (guard 3) to the highest
+# article number in the index, which then rejects every later SENTENCE-initial
+# body header as non-monotonic. That coupling is what made F2 look like it had
+# no effect until F1 was correct.
+_TOC_LINE = re.compile(r"\.{6,}\s*\d")
+
+# Sprint 10a F2, guard 5 — the minimum body a SENTENCE-initial header must have.
+#
+# Not every index has dot leaders. Staging doc 89 (COEAS Andalucía) opens with
+# four pages of run-on contents —
+#   "Artículo 1. Ámbito territorial. Artículo 2. Ámbito funcional. Artículo 3. …"
+# — with no leaders at all, so `_on_toc_line` cannot see it. Every entry is
+# sentence-initial, capitalised and perfectly sequential, which is to say it
+# satisfies F2 exactly. Measured: F2 without this guard turns those four pages
+# into 76 chunks of 28-51 characters that are pure title and zero content —
+# strictly worse retrieval decoys than the packed chunks they replace.
+#
+# The separating fact, measured across all 33 chunked prose documents on
+# staging: an index entry's segment is 28-51 characters, while the smallest
+# genuine article F2 recovers is 306 (doc 67 `Art. 2.- Ámbito territorial`).
+# The threshold sits near the geometric midpoint of that gap, calibrated to
+# neither edge, with ~3x margin below and ~2x above.
+#
+# Measured cost over that same corpus: 75 index segments dropped from doc 89,
+# and exactly one genuine article anywhere else — doc 67 `Art. 51.- De la
+# jubilación. Según la legislación vigente en cada momento.` (77 chars), a stub
+# that defers to the law and carries nothing retrievable of its own.
+#
+# It fails safe. Dropping an anchor never deletes text — the segment stays
+# merged into the preceding chunk, which is exactly what the pre-Sprint-10a
+# chunker did with it. The worst case for a genuinely short article is
+# "no better than before", never "lost".
+_MIN_SENTENCE_ANCHOR_BODY = 150
+
+
+def _line_bounds(text: str, s: int) -> tuple[int, int]:
+    """(start, end) offsets of the physical line containing offset `s`."""
+    start = text.rfind("\n", 0, s) + 1
+    end = text.find("\n", s)
+    return start, (len(text) if end == -1 else end)
+
+
+def _on_toc_line(text: str, s: int) -> bool:
+    """Guard 4 (Sprint 10a F1) — is this candidate on a table-of-contents line?
+
+    Line-scoped, not page-scoped or offset-scoped: a real article header never
+    ends in a dot leader + page number, and an index entry always does. This
+    rejects the anchor only; the index text itself still flows into the
+    paragraph fallback rather than being deleted (the extract_columns rule —
+    keep a stray bit of furniture rather than risk deleting an article)."""
+    start, end = _line_bounds(text, s)
+    return _TOC_LINE.search(text[start:end]) is not None
+
+
+def _at_sentence_start(text: str, s: int) -> bool:
+    """Sprint 10a F2 — is this candidate the first token of a sentence?
+
+    Guard 1 (`_at_line_start`) exists to kill inline cross-references, and it is
+    right to. But it also drops a REAL header whose line break did not survive
+    PDF text extraction. Measured on staging doc 75 (ESTATUTO julio2025), that
+    cost exactly three articles their own chunk — 26, 27 and **37**. Article 37
+    is `Descanso semanal, fiestas y permisos`, i.e. THE permisos article, and it
+    was buried mid-way through a 4 613-char chunk that opens with art. 36
+    (Trabajo nocturno), spanning pages 66-74. That is precisely the Correction-03
+    buried-grant shape the 2c re-chunk was built to eliminate. In the extracted
+    stream it reads:
+        "…durante la jornada de trabajo. Artículo 37. Descanso semanal, …"
+
+    So: accept a candidate that opens a sentence (preceded by `.`/`;`/`:` and
+    whitespace). This is a WEAKER positional signal than a line start, so the
+    caller compensates by requiring BOTH remaining guards — capitalised AND
+    monotonic — where a line-anchored candidate needs only capitalisation.
+    A lowercase inline reference ("…según el artículo 22 del Estatuto…") is
+    still rejected on case; a capitalised backward reference is still rejected
+    on monotonicity. Deliberately NOT a per-article special case for 26/27/37:
+    hardcoding known article numbers is the digit-regex failure class deleted in
+    7f (ADR-0028)."""
+    i = s - 1
+    while i >= 0 and text[i] in " \t\n\r":
+        i -= 1
+    return i >= 0 and text[i] in ".;:"
+
 
 def _build_text_and_pagemap(units: list[tuple[int, str]]) -> tuple[str, list[tuple[int, int]]]:
     """Join (page, text) units into one string; return (text, offset→page map).
@@ -145,9 +240,41 @@ def _find_anchors(text: str) -> list[int]:
 
     accepted: list[int] = []
     last_num = 0
+    # Sprint 10a F2: the number of the most recently ACCEPTED numeric header —
+    # distinct from `last_num`, which is a running HIGH-WATER MARK. Guard 3 uses
+    # the high-water mark, which is right for its job (rejecting a lowercase
+    # backward reference) but far too weak to license a sentence-initial header:
+    # measured on doc 75, `last_num` is already 58 by the time the body reaches
+    # article 23, so `num >= last_num` rejects every real sentence-initial
+    # header in the document. `prev_num` supports the much stronger and
+    # non-tunable test F2 actually wants — "is this the NEXT header in a running
+    # sequence?".
+    prev_num = 0
+    # Offsets accepted via F2 rather than a line start — the only ones guard 5
+    # is allowed to reconsider. A line-anchored header keeps 2c's behaviour
+    # exactly, however short its article is.
+    sentence_anchored: set[int] = set()
     for start, kind, num in cands:
-        if not _at_line_start(text, start):
+        # Guard 4 (Sprint 10a F1): never anchor on a table-of-contents entry,
+        # whatever else is true about it. Checked before the positional guards
+        # because a TOC line IS line-anchored and capitalised and monotonic —
+        # it passes all three original guards, which is why the Estatuto's index
+        # produced 25 article-lookalike chunks.
+        if _on_toc_line(text, start):
             continue
+
+        line_anchored = _at_line_start(text, start)
+
+        # Guard 1, relaxed (Sprint 10a F2): a numeric es header may also open a
+        # SENTENCE, for the case where the PDF's line break did not survive
+        # extraction. Only `es_num` — it is the only kind with both remaining
+        # guards (case AND number) available to compensate for the weaker
+        # position. `es_ord`/`disp`/`eu` stay strictly line-anchored: they have
+        # no number to check monotonicity against, so relaxing them would trade
+        # a real precision guard for nothing.
+        if not line_anchored:
+            if kind != "es_num" or not _at_sentence_start(text, start):
+                continue
 
         if kind in ("es_ord", "disp"):
             # Spelled-out article / disposition: capitalised + line-anchored is
@@ -181,16 +308,58 @@ def _find_anchors(text: str) -> list[int]:
         # rejected (22 < 40), while a genuinely sequential lowercase header is
         # kept.
         is_cap = text[start] == text[start].upper()
+
+        if not line_anchored:
+            # Sprint 10a F2: a SENTENCE-initial candidate has the weakest
+            # position, so it must clear BOTH remaining guards — capitalised AND
+            # in-sequence — not either one, and "in sequence" means the strict
+            # SUCCESSOR of the last accepted header, not merely "not smaller".
+            # This is what keeps the 2c false-positive corpus at 100% rejected:
+            # a lowercase inline ref fails the case guard, and any capitalised
+            # cross-reference — backward OR forward — fails the successor test
+            # unless it happens to name exactly the next article, in a sentence
+            # that opens with it, in a document that has not already emitted it.
+            if is_cap and num is not None and num == prev_num + 1:
+                accepted.append(start)
+                sentence_anchored.add(start)
+                prev_num = num
+                last_num = max(last_num, num)
+            continue
+
         if is_cap:
             accepted.append(start)
             if num is not None:
                 last_num = max(last_num, num)
+                prev_num = num
         elif num is not None and num >= last_num:
             accepted.append(start)
             last_num = num
+            prev_num = num
 
     # De-dup (an offset can match >1 candidate pattern) and keep order.
-    return sorted(set(accepted))
+    ordered = sorted(set(accepted))
+
+    # Guard 5 (Sprint 10a F2): a sentence-initial header must actually have an
+    # article under it. Applied here rather than inside the loop because the
+    # segment's extent is only known once the NEXT anchor is known.
+    #
+    # Single pass, gaps measured against the pre-removal list. That is the
+    # conservative direction for the case this exists for: a run-on index is a
+    # run of consecutive tiny gaps, so every entry in it is dropped together and
+    # the whole index collapses back into one packed chunk. Re-measuring after
+    # each removal would instead let the first entry survive by inheriting the
+    # gap of everything dropped after it.
+    if sentence_anchored:
+        kept = []
+        for i, off in enumerate(ordered):
+            if off in sentence_anchored:
+                end = ordered[i + 1] if i + 1 < len(ordered) else len(text)
+                if end - off < _MIN_SENTENCE_ANCHOR_BODY:
+                    continue
+            kept.append(off)
+        return kept
+
+    return ordered
 
 
 def _pack_to_cap(text: str, count_tokens: Callable[[str], int], cap: int) -> list[str]:
@@ -254,6 +423,29 @@ def _hard_split_words(text: str, count_tokens: Callable[[str], int], cap: int) -
     return pieces
 
 
+def _strip_toc_lines(content: str) -> str:
+    """Sprint 10a F1, second half — drop table-of-contents lines from a chunk's
+    body, keeping every other line.
+
+    Guard 4 stops an index entry from STARTING a chunk, but the index text still
+    flows into the preamble's paragraph fallback. On doc 75 that leaves six
+    front-matter chunks (pages 1-11) that are 52-93% dot-leader lines: no
+    answerable content, but the full topical keyword set of every article in the
+    document. Harmless while convenio chunks out-compete them; on the
+    national-law-only fallback path they compete directly for the synthesis cap
+    against the very questions the fallback exists to answer.
+
+    Line-level, so there is no ratio threshold to tune and no whole chunk is
+    deleted — the same granularity as the guard, and the same treatment
+    `extract_columns` already gives repeating headers/footers. It cannot delete
+    an article: a rule of law never ends in a dot leader followed by a page
+    number. A chunk left empty by the strip is dropped by `emit()`'s existing
+    empty check, which is how the pure-index chunks disappear without a
+    special case."""
+    kept = [ln for ln in content.splitlines() if not _TOC_LINE.search(ln)]
+    return "\n".join(kept)
+
+
 def _article_header_line(seg: str) -> str:
     """First non-empty line of an article segment — its `Artículo N.º <título>`
     header, carried onto continuation sub-chunks of an oversized article."""
@@ -283,7 +475,10 @@ def chunk_stream(
     chunks: list[dict] = []
 
     def emit(content: str, start_off: int, end_off: int) -> None:
-        content = content.strip()
+        # Sprint 10a F1: index lines are furniture — strip them before the empty
+        # check, so a chunk that was nothing but index disappears here rather
+        # than being special-cased anywhere downstream.
+        content = _strip_toc_lines(content).strip()
         if not content:
             return
         chunks.append(
