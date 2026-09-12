@@ -96,7 +96,12 @@ class Settings(BaseSettings):
     # ANSWER_MODEL / ANSWER_ENDPOINT MUST point at an EU-available model/endpoint
     # (GDPR is deploy-time — deploy.md §1: EU endpoint, signed DPA, zero-retention).
     answer_provider: str = "claude"
-    answer_model: str = "claude-sonnet-4-5"
+    # Sprint 10-M: claude-sonnet-4-5 -> claude-sonnet-5. This default is only
+    # a display value for /health/config — the real per-call model always
+    # arrives as hr-backend-supplied provider_config.model (never read from
+    # here for an actual /synthesise or /ground call). Kept in sync anyway so
+    # /health/config doesn't lie about what's actually configured upstream.
+    answer_model: str = "claude-sonnet-5"
     answer_endpoint: str = "https://api.anthropic.com"
 
     # --- Question router (Sprint 2b-2, ADR-0016) ---
