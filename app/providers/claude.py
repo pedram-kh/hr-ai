@@ -812,7 +812,14 @@ OCR_USER_PROMPT = (
 # "≈$3 for the whole backfill" projection silently drifts from reality.
 OCR_PRICING_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-sonnet-4-5": (3.00, 15.00),
-    "claude-sonnet-5": (2.00, 10.00),
+    # Sprint 10-M: this entry was pre-staged at the introductory launch price
+    # ($2.00/$10.00, in effect through 2026-08-31). Anthropic's standard rate
+    # of $3.00/$15.00 took effect 2026-09-01 and was still current when this
+    # sprint checked the live pricing page (2026-09-12) — i.e. Sonnet 5 is
+    # priced identically to Sonnet 4.5 today, not cheaper. Corrected so
+    # cost_usd is accurate from the first real Sonnet 5 call; re-check this
+    # row if Anthropic revises the rate card again.
+    "claude-sonnet-5": (3.00, 15.00),
     "claude-opus-5": (5.00, 25.00),
     # Added Sprint 7g Item 1 (ADR-0029) — the ROUTER_MODEL, also used for the
     # escalation-explanation "Resumen IA" paragraph (hr-backend's
@@ -873,7 +880,17 @@ class ClaudeProvider(AnswerProvider):
         started = time.monotonic()
         resp = client.messages.create(
             model=config.model,
-            max_tokens=1024,
+            # Sprint 10-M: 1024 -> 4096 (matches /ground's first-tier budget).
+            # Named, narrow exception to the model-swap-only fence, authorized
+            # for the record: the 1024 ceiling was tuned against Sonnet 4.5's
+            # completion style; keeping it would confound the model
+            # measurement with a budget artifact (Sonnet 5 produced longer
+            # completions on real chunk-dense questions and was observed
+            # hitting this ceiling, cutting the JSON mid-structure ->
+            # unparseable -> silent escalation). No retry-path added here —
+            # /synthesise still has none, unlike /ground (see review.md
+            # follow-up) — this only gives the first (only) attempt more room.
+            max_tokens=4096,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
         )
