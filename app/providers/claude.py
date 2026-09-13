@@ -247,10 +247,20 @@ ROUTER_SYSTEM_PROMPT = (
     "tema, reformulada para buscarse por separado. Si es de un solo tema, devuelve "
     "subqueries vacío. La etiqueta de una pregunta compuesta es la del tema "
     "predominante (normalmente \"prose\").\n\n"
+    "ADEMÁS, reformula el tema legal subyacente de la pregunta en vocabulario de "
+    "convenio/ley cuando la pregunta use lenguaje coloquial o situacional (p. ej. "
+    "'mi jefe me ha denegado las vacaciones, ¿puede?' → 'régimen de disfrute y "
+    "fijación de vacaciones'). Devuelve estas reformulaciones en "
+    "'decomposed_queries'. Si la pregunta ya está en vocabulario de convenio, o "
+    "no hay reformulación que añada nada, devuelve una lista vacía. No es lo "
+    "mismo que 'subqueries' (que separa temas distintos): 'decomposed_queries' "
+    "reformula, no separa; puede haber una para una pregunta de un solo tema, y "
+    "ninguna para una compuesta ya bien fraseada.\n\n"
     "FORMATO: devuelve EXCLUSIVAMENTE un objeto JSON válido, sin texto alrededor:\n"
     '{"label": "salary|prose|off_domain", '
     '"confidence": <número entre 0 y 1>, '
-    '"subqueries": [<subpreguntas autónomas, o vacío si es de un solo tema>]}'
+    '"subqueries": [<subpreguntas autónomas, o vacío si es de un solo tema>], '
+    '"decomposed_queries": [<reformulaciones en vocabulario de convenio, o vacío>]}'
 )
 
 
@@ -309,6 +319,16 @@ GROUND_SYSTEM_PROMPT = (
 # it (the "unparseable/truncated → escalate" floor stays).
 GROUND_MAX_TOKENS = 4096
 GROUND_MAX_TOKENS_RETRY = 8192
+
+# Sprint 10b (ADR-0033, plan §D.1) — the /synthesise mirror of the above. Same
+# first-tier budget (Sprint 10-M already raised it to 4096 to match /ground's),
+# same doubled retry budget, same one-retry-then-distinct-outcome shape. Until
+# now a truncated /synthesise response landed directly in the unparseable/
+# parse_error branch — indistinguishable in the trace from a genuinely bad
+# completion, and escalating on the FIRST attempt at exactly the budget /ground
+# needed a retry to clear.
+SYNTHESISE_MAX_TOKENS = 4096
+SYNTHESISE_MAX_TOKENS_RETRY = 8192
 
 # Output-token budget for the segmentation JSON (Sprint 7b-2). A multi-province
 # periodo file emits one verbose object per scope (value + raw_values + full
@@ -877,24 +897,63 @@ class ClaudeProvider(AnswerProvider):
         client = anthropic.Anthropic(api_key=api_key, base_url=config.endpoint or None)
         user_prompt = _build_user_prompt(question, chunks)
 
+        # Sprint 10-M: 1024 -> 4096 (matches /ground's first-tier budget). Named,
+        # narrow exception to the model-swap-only fence, authorized for the
+        # record: the 1024 ceiling was tuned against Sonnet 4.5's completion
+        # style; keeping it would confound the model measurement with a budget
+        # artifact (Sonnet 5 produced longer completions on real chunk-dense
+        # questions and was observed hitting this ceiling, cutting the JSON
+        # mid-structure -> unparseable -> silent escalation).
+        #
+        # Sprint 10b (ADR-0033, plan §D.1): the retry-once-on-truncation pattern
+        # /ground already has (Correction-04) — a truncation is a budget problem,
+        # never evidence of a bad completion, so retry ONCE at a doubled budget
+        # before giving up. Line-for-line port of ground()'s own retry block; no
+        # prompt text changes anywhere in this method.
         started = time.monotonic()
         resp = client.messages.create(
             model=config.model,
-            # Sprint 10-M: 1024 -> 4096 (matches /ground's first-tier budget).
-            # Named, narrow exception to the model-swap-only fence, authorized
-            # for the record: the 1024 ceiling was tuned against Sonnet 4.5's
-            # completion style; keeping it would confound the model
-            # measurement with a budget artifact (Sonnet 5 produced longer
-            # completions on real chunk-dense questions and was observed
-            # hitting this ceiling, cutting the JSON mid-structure ->
-            # unparseable -> silent escalation). No retry-path added here —
-            # /synthesise still has none, unlike /ground (see review.md
-            # follow-up) — this only gives the first (only) attempt more room.
-            max_tokens=4096,
+            max_tokens=SYNTHESISE_MAX_TOKENS,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
         )
+        budget = SYNTHESISE_MAX_TOKENS
+        retried_on_truncation = False
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            retried_on_truncation = True
+            budget = SYNTHESISE_MAX_TOKENS_RETRY
+            resp = client.messages.create(
+                model=config.model,
+                max_tokens=SYNTHESISE_MAX_TOKENS_RETRY,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
         elapsed_ms = int((time.monotonic() - started) * 1000)
+
+        # Still truncated after the retry → a DISTINCT outcome, not a parse
+        # failure and not a fabricated claim. hr-backend still escalates (empty
+        # answer/no citations fails Check B, same floor as today), but the trace
+        # says synthesis_truncated so a truncation is never read as "the model
+        # produced unparseable garbage" — mirrors /ground's grounding_truncated
+        # (claude.py ground()) exactly.
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            return SynthesisResult(
+                answer="",
+                citations=[],
+                grounding_signal={"grounded": False, "citation_count": 0, "top_chunk_score": 0.0},
+                confidence=0.0,
+                authority_used=[],
+                trace_fragment={
+                    "provider": config.provider,
+                    "model": config.model,
+                    "synthesis_ms": elapsed_ms,
+                    "synthesis_truncated": True,
+                    "retried_on_truncation": retried_on_truncation,
+                    "max_tokens": budget,
+                    "stop_reason": "max_tokens",
+                    "completion_tokens": getattr(resp.usage, "output_tokens", None) if getattr(resp, "usage", None) else None,
+                },
+            )
 
         raw_text = "".join(
             block.text for block in resp.content if getattr(block, "type", None) == "text"
@@ -904,6 +963,12 @@ class ClaudeProvider(AnswerProvider):
             envelope = _extract_json(raw_text)
         except (json.JSONDecodeError, ValueError):
             # Unparseable output → ungrounded. hr-backend escalates (no guess).
+            # Sprint 10b (ADR-0033, plan §D.2): stop_reason + completion_tokens
+            # enrichment — `resp` (and, when present, `resp.usage`) is already in
+            # scope here; a truncation-flavored parse failure is now
+            # distinguishable from a genuine bad completion even if it somehow
+            # reaches this branch (e.g. a non-"max_tokens" stop with malformed
+            # JSON) without needing a human to re-run the call with logging.
             return SynthesisResult(
                 answer="",
                 citations=[],
@@ -915,6 +980,9 @@ class ClaudeProvider(AnswerProvider):
                     "model": config.model,
                     "synthesis_ms": elapsed_ms,
                     "parse_error": True,
+                    "retried_on_truncation": retried_on_truncation,
+                    "stop_reason": getattr(resp, "stop_reason", None),
+                    "completion_tokens": getattr(resp.usage, "output_tokens", None) if getattr(resp, "usage", None) else None,
                 },
             )
 
@@ -1059,7 +1127,13 @@ class ClaudeProvider(AnswerProvider):
             # Unparseable output → no paragraph. hr-backend's caller treats an
             # empty answer exactly like a failed no-new-claims check (falls
             # back to the deterministic sentences) — never guesses.
-            return ExplainResult(answer="", trace_fragment={**trace_fragment, "parse_error": True})
+            # Sprint 10b (ADR-0033, plan §D.2): completion_tokens is already in
+            # trace_fragment above; add stop_reason for consistency.
+            return ExplainResult(answer="", trace_fragment={
+                **trace_fragment,
+                "parse_error": True,
+                "stop_reason": getattr(resp, "stop_reason", None),
+            })
 
         answer = str(envelope.get("answer", "")).strip()
 
@@ -1072,10 +1146,13 @@ class ClaudeProvider(AnswerProvider):
         config: ProviderConfig,
     ) -> RouterResult:
         """Router classification (ADR-0016) with the SMALL/FAST model. Returns a
-        label + confidence and, for a compound question, the decomposed
-        subqueries. On any parse/transport failure the caller (hr-backend) is
-        fail-safe — this method never raises a routing decision it can't justify;
-        it returns a low-confidence prose result so hr-backend defaults safely."""
+        label + confidence, for a compound question the decomposed subqueries,
+        and (Sprint 10b, ADR-0033) for a situational/colloquial question the
+        decomposed_queries retrieval rephrasings — a SEPARATE, PARALLEL field,
+        never a variant of subqueries. On any parse/transport failure the caller
+        (hr-backend) is fail-safe — this method never raises a routing decision
+        it can't justify; it returns a low-confidence prose result (decomposed_
+        queries defaults to []) so hr-backend defaults safely."""
         import anthropic
 
         client = anthropic.Anthropic(api_key=api_key, base_url=config.endpoint or None)
@@ -1101,7 +1178,15 @@ class ClaudeProvider(AnswerProvider):
                 confidence=0.0,
                 subqueries=[],
                 reason="router_parse_error",
-                trace_fragment={"provider": config.provider, "model": config.model, "router_ms": elapsed_ms, "parse_error": True},
+                trace_fragment={
+                    "provider": config.provider,
+                    "model": config.model,
+                    "router_ms": elapsed_ms,
+                    "parse_error": True,
+                    # Sprint 10b (ADR-0033, plan §D.2).
+                    "stop_reason": getattr(resp, "stop_reason", None),
+                    "completion_tokens": getattr(resp.usage, "output_tokens", None) if getattr(resp, "usage", None) else None,
+                },
             )
 
         label = str(envelope.get("label", "prose")).strip().lower()
@@ -1109,11 +1194,16 @@ class ClaudeProvider(AnswerProvider):
             label = "prose"
         confidence = float(envelope.get("confidence", 0.0) or 0.0)
         subqueries = [str(s).strip() for s in (envelope.get("subqueries") or []) if str(s).strip()]
+        # Sprint 10b (ADR-0033): situational/colloquial retrieval rephrasings.
+        # `.get("decomposed_queries")` on an envelope from a pre-10b prompt (or
+        # any transport that stripped the key) is simply None → [] → no change.
+        decomposed_queries = [str(s).strip() for s in (envelope.get("decomposed_queries") or []) if str(s).strip()]
 
         return RouterResult(
             label=label,
             confidence=confidence,
             subqueries=subqueries,
+            decomposed_queries=decomposed_queries,
             reason="llm",
             trace_fragment={
                 "provider": config.provider,
@@ -1181,6 +1271,11 @@ class ClaudeProvider(AnswerProvider):
                     "grounding_truncated": True,
                     "retried_on_truncation": retried_on_truncation,
                     "max_tokens": budget,
+                    # Sprint 10b (ADR-0033, plan §D.2). stop_reason is redundant
+                    # with grounding_truncated=True here but kept for consistency
+                    # across every enriched site.
+                    "stop_reason": "max_tokens",
+                    "completion_tokens": getattr(resp.usage, "output_tokens", None) if getattr(resp, "usage", None) else None,
                 },
             )
 
@@ -1195,7 +1290,16 @@ class ClaudeProvider(AnswerProvider):
                 grounded=False,
                 claims=[],
                 ungrounded=["<grounding check unparseable>"],
-                trace_fragment={"provider": config.provider, "model": config.model, "ground_ms": elapsed_ms, "parse_error": True, "retried_on_truncation": retried_on_truncation},
+                trace_fragment={
+                    "provider": config.provider,
+                    "model": config.model,
+                    "ground_ms": elapsed_ms,
+                    "parse_error": True,
+                    "retried_on_truncation": retried_on_truncation,
+                    # Sprint 10b (ADR-0033, plan §D.2).
+                    "stop_reason": getattr(resp, "stop_reason", None),
+                    "completion_tokens": getattr(resp.usage, "output_tokens", None) if getattr(resp, "usage", None) else None,
+                },
             )
 
         claims_in = envelope.get("claims") or []
@@ -1292,6 +1396,9 @@ class ClaudeProvider(AnswerProvider):
                     "model": config.model,
                     "propose_ms": elapsed_ms,
                     "parse_error": True,
+                    # Sprint 10b (ADR-0033, plan §D.2).
+                    "stop_reason": getattr(resp, "stop_reason", None),
+                    "completion_tokens": getattr(resp.usage, "output_tokens", None) if getattr(resp, "usage", None) else None,
                 },
             )
 
@@ -1429,6 +1536,13 @@ class ClaudeProvider(AnswerProvider):
                         "model": config.model,
                         "segment_ms": elapsed_ms,
                         "parse_error": True,
+                        # Sprint 10b (ADR-0033, plan §D.2). `truncated` (above)
+                        # already distinguishes a max_tokens cutoff from a
+                        # genuinely malformed stream; stop_reason/completion_tokens
+                        # give the same detail the other seven enriched sites do.
+                        "truncated": truncated,
+                        "stop_reason": getattr(resp, "stop_reason", None),
+                        "completion_tokens": getattr(resp.usage, "output_tokens", None) if getattr(resp, "usage", None) else None,
                     },
                 )
 
@@ -1570,7 +1684,9 @@ class ClaudeProvider(AnswerProvider):
             # matcher is untouched until Phase 3) and is visibly retryable.
             return GroupProposalResult(
                 groups=[],
-                trace_fragment={**base_trace, "parse_error": True, "group_count": 0},
+                # Sprint 10b (ADR-0033, plan §D.2): completion_tokens is already
+                # in base_trace above; add stop_reason for consistency.
+                trace_fragment={**base_trace, "parse_error": True, "group_count": 0, "stop_reason": getattr(resp, "stop_reason", None)},
             )
 
         raw_groups = envelope.get("groups") or []
@@ -1820,9 +1936,11 @@ class ClaudeProvider(AnswerProvider):
         try:
             envelope = _extract_json(raw_text)
         except (json.JSONDecodeError, ValueError):
+            # Sprint 10b (ADR-0033, plan §D.2): completion_tokens is already in
+            # trace_fragment above; add stop_reason for consistency.
             return OcrPageResult(
                 layout="parse_error",
-                trace_fragment={**trace_fragment, "parse_error": True},
+                trace_fragment={**trace_fragment, "parse_error": True, "stop_reason": getattr(resp, "stop_reason", None)},
             )
 
         layout = str(envelope.get("layout", "single_column")).strip() or "single_column"

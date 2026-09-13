@@ -782,6 +782,13 @@ def route(req: RouteRequest) -> JSONResponse:
     question into subqueries (ADR-0016). Small/fast model. Runs AFTER hr-backend's
     hardcoded guardrail baseline (sensitive / other-employee never reach here).
 
+    Sprint 10b (ADR-0033) additively returns `decomposed_queries` — situational/
+    colloquial retrieval rephrasings, a SEPARATE field from `subqueries`. hr-
+    backend's `RouterService::classify()` reads it defensively (`?? []`); every
+    other existing consumer of this response reads only the keys it already
+    knows and silently drops unknown ones (plan.md §B.1 — proven today by
+    `reason` already being present here and already ignored downstream).
+
     On a provider failure this returns 200 with `{ "error": "provider_error", ... }`
     so hr-backend stays FAIL-SAFE (the safe prose+floor path), never a misroute.
     """
@@ -800,6 +807,7 @@ def route(req: RouteRequest) -> JSONResponse:
                 "label": result.label,
                 "confidence": result.confidence,
                 "subqueries": result.subqueries,
+                "decomposed_queries": result.decomposed_queries,
                 "reason": result.reason,
                 "trace_fragment": result.trace_fragment,
             }

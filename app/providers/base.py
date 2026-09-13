@@ -108,11 +108,20 @@ class RouterResult:
     `label` ∈ salary | prose | off_domain. `subqueries` is non-empty only for a
     compound question (used by hr-backend's recall hardening: one /retrieve per
     sub-query, unioned — §6). The router sees the QUESTION only, never the chunks.
+
+    `decomposed_queries` (Sprint 10b, ADR-0033) is a SEPARATE, PARALLEL field —
+    never a variant of `subqueries`. `subqueries` SPLITS a compound question into
+    its constituent topics; `decomposed_queries` REPHRASES a (possibly single-
+    topic) question's situational/colloquial phrasing into corpus vocabulary, for
+    retrieval only. Defaults to `[]` so every existing construction site (the
+    parse-error fail-safe branch, test fakes) is unaffected — additive by
+    construction (plan.md §B.1).
     """
 
     label: str
     confidence: float = 0.0
     subqueries: list[str] = field(default_factory=list)
+    decomposed_queries: list[str] = field(default_factory=list)
     reason: str = ""
     trace_fragment: dict = field(default_factory=dict)
 
