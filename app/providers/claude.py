@@ -701,6 +701,169 @@ SEGMENT_FACTS_SYSTEM_PROMPT = (
 SEGMENT_TEXT_CAP = 48000
 
 
+# --- Topic-parameterized segmentation (Sprint 10c, plan §A.1) --------------
+#
+# The ORIGINAL SEGMENT_FACTS_SYSTEM_PROMPT/_build_segment_prompt above are for
+# the 7b-2 `reference_source` path — a human-curated, MULTI-PROVINCE
+# recopilación mixing many convenios in one file, hence header-carry. The new
+# per-(convenio, topic) driver (over already-ingested convenio text, plan
+# §A.1) calls this ONCE PER CONVENIO with passage-scoped (anchor-filtered)
+# text, so there is no cross-convenio scope ambiguity to resolve — the caller
+# already knows which convenio(s) the text belongs to. Header-carry is
+# therefore DROPPED for this path; everything else that made 7b-2's restraint
+# real (rules 1/2/5/7/8/9/10/11 verbatim) carries over untouched. Only rule 6
+# (topic binding) and rule 12 (content gate) become topic-driven instead of
+# hardcoded to periodo de prueba.
+#
+# Sprint 10c D2 — preaviso is defined STRICTLY as the employee's OWN
+# resignation notice. The real corpus's anchor "preaviso" also hits dismissal
+# notice, shift-change notice, temporary-worker recall notice, and working-
+# time-flexibility notice (plan §B.4) — a real polysemy trap, decided now
+# rather than discovered by the gate: those four contexts are explicit
+# negatives, appended only when the target topic IS preaviso.
+PREAVISO_DISAMBIGUATION_ES = (
+    "13. DEFINICIÓN ESTRICTA DE 'preaviso' (este topic SOLO significa esto): el "
+    "plazo que la PERSONA TRABAJADORA debe dar a la empresa antes de DIMITIR "
+    "voluntariamente (su propia baja voluntaria/dimisión). NO es ninguna de las "
+    "siguientes — NO emitas ningún hecho para ellas, aunque contengan la palabra "
+    "'preaviso':\n"
+    "   a) el preaviso de DESPIDO que la EMPRESA debe dar a la persona trabajadora "
+    "(despido objetivo, disciplinario o colectivo) — eso es sensitive_topic, fuera "
+    "de este topic por completo;\n"
+    "   b) el preaviso de CAMBIO DE TURNO u horario (p. ej. 'con un preaviso "
+    "mínimo de cinco días' sobre horas complementarias o flexibilidad horaria);\n"
+    "   c) el preaviso de LLAMAMIENTO de un trabajador fijo-discontinuo o de "
+    "reincorporación tras una excedencia;\n"
+    "   d) cualquier otro preaviso que no sea la dimisión voluntaria de la propia "
+    "persona trabajadora.\n"
+    "Si una línea usa 'preaviso' pero el sujeto que lo DA es la empresa (no la "
+    "persona trabajadora dimitiendo), NO es este topic: ignórala por completo."
+)
+
+
+def _build_topic_segment_system_prompt(target_topic_name: str) -> str:
+    """The topic-driven system prompt (Sprint 10c). Single-convenio, passage-
+    scoped, no header-carry — see the module comment above for why. Rules
+    1/2/3/4/5/7/8/9/10/11 are the SAME restraint architecture 7b-2 proved (the
+    eval was the deliverable there; reused, not rebuilt, here). Rule 3 gets an
+    explicit multi-year-schedule clarification (D5 — a real corpus shape,
+    plan §B.4's c.20 pattern) that the original prompt never needed to state."""
+    topic_lower = target_topic_name.strip().lower()
+    extra_rule = "\n" + PREAVISO_DISAMBIGUATION_ES if topic_lower == "preaviso" else ""
+    return (
+        "Eres un agente de segmentación documental para una plataforma de RR. HH. "
+        "que gestiona convenios colectivos españoles. Recibes PASAJES ya "
+        f"filtrados de UN convenio colectivo, relacionados con el tema "
+        f"'{target_topic_name}', y una lista de VOCABULARIO CONTROLADO (el "
+        "convenio al que pertenece este texto, con su territorio y sector "
+        "derivados, y sus categorías profesionales si las hay). El texto YA "
+        "pertenece a un convenio conocido — NO hay arrastre de encabezados entre "
+        "provincias que resolver; usa el convenio de la lista tal cual.\n\n"
+        f"Tu tarea: extraer HECHOS sobre '{target_topic_name}' ÚNICAMENTE, uno por "
+        "ÁMBITO (grupo/categoría profesional dentro de este convenio, si el "
+        "contenido varía por grupo; si no varía, un único hecho para todo el "
+        "convenio), y asignar a cada hecho su convenio_id.\n\n"
+        "REGLAS ABSOLUTAS:\n"
+        "1. SOLO PROPONES. No decides nada; un humano revisa y verifica. Tu salida "
+        "es INERTE hasta que un humano la verifique — puedes equivocarte sin "
+        "causar daño, salvo que des un ámbito equivocado con alta confianza (ese "
+        "es el peor error). Ante la duda del ámbito, BAJA la confianza y rellena "
+        "`uncertainty`.\n"
+        "2. VOCABULARIO CERRADO: vincula cada hecho a un `convenio_id` de la "
+        "lista. JAMÁS inventes un convenio ni devuelvas texto libre como id. Si "
+        "el pasaje se presenta como ámbito ESTATAL supletorio o una regla general "
+        "del Estatuto de los Trabajadores que NO coincide con ningún convenio de "
+        "la lista, NO fuerces un convenio: omite el hecho o emítelo con "
+        "`uncertainty.field='scope'`. Mejor marcar incierto que adivinar.\n"
+        "3. UN HECHO POR ÁMBITO (valores múltiples y CALENDARIOS MULTIANUALES): un "
+        "bloque de un grupo es UN hecho, aunque su desglose ocupe varias líneas "
+        "(p. ej. tipos de contrato, o un calendario de varios años como 'Año "
+        "2025: 1637 horas… Año 2028: 1628 horas'). Mete el desglose COMPLETO en "
+        "`value` y en `raw_values` — NO crees un hecho por año ni por tipo de "
+        "contrato (regla 8: nunca propongas fechas de vigencia; un calendario "
+        "multianual dentro de la vigencia del documento fuente es UN hecho). El "
+        "ÁMBITO es la unidad consultable; el desglose vive dentro.\n"
+        "4. group_label OBLIGATORIO cuando el contenido varíe por grupo: devuelve "
+        "SIEMPRE el grupo TAL CUAL aparece ('Grupo 1', 'Grupo 2 (resto áreas)', "
+        "'Obreros y subalternos'). Es el discriminador de identidad del hecho. Si "
+        "una categoría de la lista del convenio coincide claramente con el grupo, "
+        "pon también `job_category_id`; si no, déjalo null (lo normal). Si el "
+        "contenido es EL MISMO para todo el personal, deja `group_label` null — "
+        "es un hecho convenio-wide, no fuerces un grupo que el texto no exige.\n"
+        "5. EXPRESIONES DE GRUPO COMPUESTAS ('Grupo 1 y área cinco de Grupo 2') no "
+        "mapean a una sola categoría: deja `job_category_id` null y marca "
+        "`uncertainty.field='group'` con el motivo.\n"
+        f"6. topic: vincula SIEMPRE `topic_id` al id de '{target_topic_name}' que "
+        "se te da en la lista de topics — es el ÚNICO topic válido en esta "
+        "llamada. Nunca inventes ni uses otro topic_id.\n"
+        "7. NADA DE SALARIOS: ignora por completo tablas de salarios, €/hora, SMI "
+        "y rejillas de retribución (van por otra vía).\n"
+        "8. NO propongas vigencia ni fechas (las fija el sistema, a partir del "
+        "documento fuente completo — no por año dentro de un calendario "
+        "multianual, ver regla 3). NO propongas autoridad.\n"
+        "9. TRAZABILIDAD OBLIGATORIA: cada hecho lleva `source_excerpt` = la(s) "
+        "línea(s) EXACTAS de origen para que el revisor compruebe el ámbito "
+        "contra la cita. Usa los marcadores [loc:…] del texto para "
+        "`source_locator`.\n"
+        "10. confianza (0..1): honesta. Baja cuando el ámbito es ambiguo. "
+        "`uncertainty` = {field, reason} cuando dudes (field ∈ "
+        "scope|group|version|value); null si estás seguro.\n"
+        "11. ÁMBITO ESTATAL SUPLETORIO / REGLA GENERAL → NO VINCULES, marca "
+        "incierto. Cuando un pasaje se presenta como regla general que aplica "
+        "«cuando NO hay convenio territorial específico» o cita el Estatuto de "
+        "los Trabajadores como base supletoria, NO lo vincules a ningún "
+        "convenio. Emítelo con `uncertainty.field='scope'` y "
+        "reason='statutory fallback — no territorial convenio applies', dejando "
+        "el ámbito SIN vincular, u OMÍTELO.\n"
+        f"12. CONTENIDO FUERA DE TEMA → NO EMITAS NADA. Si un pasaje no trata "
+        f"ESPECÍFICAMENTE de '{target_topic_name}' tal como se define en estas "
+        "reglas, NO emitas ningún hecho para él — ignóralo por completo. No "
+        "disfraces de hecho una línea de otro tema solo porque comparte "
+        "vocabulario superficial."
+        f"{extra_rule}\n\n"
+        "FORMATO DE SALIDA: devuelve EXCLUSIVAMENTE un objeto JSON válido, sin "
+        "texto alrededor, con esta forma:\n"
+        '{"facts": [{"convenio_id": <id>, "job_category_id": <id|null>, '
+        '"group_label": "<grupo tal cual|null>", "topic_id": <id>, '
+        '"value": "<regla legible, con el desglose dentro>", '
+        '"raw_values": {<estructura literal opcional>}, "confidence": <0..1>, '
+        '"uncertainty": {"field": "scope|group|version|value", "reason": "<por qué>"}, '
+        '"source_locator": "<loc>", "source_excerpt": "<línea(s) exactas>"}]}'
+    )
+
+
+def _build_topic_segment_prompt(
+    pages_text: str,
+    candidate_convenios: list[ConvenioCandidate],
+    target_topic: VocabularyCandidate,
+) -> str:
+    """User prompt for the topic-driven path (Sprint 10c). Same text cap as
+    the original (SEGMENT_TEXT_CAP) — passage-scoped input is already far
+    smaller than a full convenio (plan §B.5), so this is a defensive ceiling,
+    not the primary sizing mechanism (that's the caller's anchor-filtering)."""
+    text = (pages_text or "").strip()
+    if len(text) > SEGMENT_TEXT_CAP:
+        text = text[:SEGMENT_TEXT_CAP] + "\n…[texto truncado]"
+    blocks = [
+        f"PASAJES FILTRADOS DEL CONVENIO (tema: '{target_topic.name}'):",
+        text,
+        "",
+        "VOCABULARIO CONTROLADO (usa solo estos ids):",
+        _convenio_candidate_block(candidate_convenios),
+        "",
+        f"Topic objetivo (el ÚNICO válido): id={target_topic.id} · {target_topic.name}",
+        "",
+        (
+            f"Extrae hechos sobre '{target_topic.name}' únicamente, uno por ámbito "
+            "(grupo si el contenido varía por grupo; convenio-wide si no varía). "
+            "No inventes convenios ni topics; marca incierto lo que no resuelvas. "
+            "Ignora todo lo que no sea específicamente este tema. Devuelve solo el "
+            "JSON."
+        ),
+    ]
+    return "\n".join(blocks)
+
+
 def _convenio_candidate_block(convenios: list[ConvenioCandidate]) -> str:
     lines = ["Convenios (vincula cada hecho a uno de estos id — territorio/sector se derivan):"]
     for c in convenios:
@@ -1492,15 +1655,28 @@ class ClaudeProvider(AnswerProvider):
         candidate_topics: list[VocabularyCandidate],
         api_key: str,
         config: ProviderConfig,
+        target_topic: VocabularyCandidate | None = None,
     ) -> SegmentedFactsResult:
-        """Segment a multi-scope reference source into per-scope facts bound to
-        the closed convenio vocabulary (Sprint 7b-2). Strict, inert proposer. On
-        a parse failure it returns an empty facts list so the source simply stays
-        unsegmented in the human queue (never a silent bad fact)."""
+        """Segment a reference source into per-scope facts bound to the closed
+        convenio vocabulary (Sprint 7b-2; topic-parameterized path added Sprint
+        10c). Strict, inert proposer. On a parse failure it returns an empty
+        facts list so the source simply stays unsegmented in the human queue
+        (never a silent bad fact).
+
+        `target_topic` is None → the ORIGINAL 7b-2 `reference_source` path,
+        UNCHANGED (multi-province header-carry, hardcoded periodo de prueba
+        binding). `target_topic` set → the Sprint 10c per-(convenio, topic)
+        path (single-convenio, passage-scoped, topic-driven prompt, D2's
+        preaviso disambiguation folded in when applicable)."""
         import anthropic  # lazy — dep only needed at call time
 
         client = anthropic.Anthropic(api_key=api_key, base_url=config.endpoint or None)
-        user_prompt = _build_segment_prompt(pages_text, candidate_convenios, candidate_topics)
+        if target_topic is not None:
+            system_prompt = _build_topic_segment_system_prompt(target_topic.name)
+            user_prompt = _build_topic_segment_prompt(pages_text, candidate_convenios, target_topic)
+        else:
+            system_prompt = SEGMENT_FACTS_SYSTEM_PROMPT
+            user_prompt = _build_segment_prompt(pages_text, candidate_convenios, candidate_topics)
 
         started = time.monotonic()
         # A multi-province periodo file yields ~30-50 verbose facts of JSON; the
@@ -1511,7 +1687,7 @@ class ClaudeProvider(AnswerProvider):
         with client.messages.stream(
             model=config.model,
             max_tokens=SEGMENT_MAX_TOKENS,
-            system=SEGMENT_FACTS_SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         ) as stream:
             for chunk in stream.text_stream:
@@ -1554,7 +1730,12 @@ class ClaudeProvider(AnswerProvider):
         categories_by_convenio: dict[int, set[int]] = {
             c.id: {jc.id for jc in c.job_categories} for c in candidate_convenios
         }
+        # Sprint 10c: in the topic-driven path, `candidate_topics` is typically
+        # empty (the caller passes ONLY `target_topic`) — fold its id in so the
+        # closed-set check below doesn't null out the one valid topic_id.
         valid_topic_ids = {c.id for c in candidate_topics}
+        if target_topic is not None:
+            valid_topic_ids.add(target_topic.id)
 
         facts: list[dict] = []
         for f in envelope.get("facts") or []:

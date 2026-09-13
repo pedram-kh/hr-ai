@@ -310,7 +310,8 @@ class ConvenioCandidateBody(BaseModel):
 
 
 class SegmentFactsRequest(BaseModel):
-    """Reference-source fact segmentation (Sprint 7b-2, ADR-0022).
+    """Reference-source fact segmentation (Sprint 7b-2, ADR-0022; extended
+    Sprint 10c for per-topic convenio-text segmentation).
 
     hr-backend passes the FULL concatenated /read-structured content (Q9 — never
     chunked, so header-carry sees the whole sequence) + the CLOSED candidate
@@ -318,7 +319,17 @@ class SegmentFactsRequest(BaseModel):
     into per-scope facts bound to real ids; it writes NOTHING (ADR-0007). The
     proposal is INERT: hr-backend persists each fact as `ai_agent`/`needs_review`
     (not answerable until a human verifies). No salary, no new vocabulary, no
-    validity/authority (hr-backend owns those)."""
+    validity/authority (hr-backend owns those).
+
+    `target_topic` (Sprint 10c, plan §A.1): when set, this call is FOR ONE
+    TOPIC ONLY — the topic-parameterized path, used by the new per-(convenio,
+    topic) driver over already-ingested convenio text (passage-scoped, single-
+    convenio, no cross-province header-carry needed). The prompt becomes
+    topic-driven (extract ONLY `target_topic`'s content; everything else emits
+    nothing) instead of the original hardcoded-to-periodo-de-prueba prompt.
+    When `target_topic` is None (the ORIGINAL 7b-2 `reference_source` path,
+    still live and untouched), behavior is byte-for-byte unchanged from before
+    this field existed — `candidate_topics` is used exactly as it always was."""
 
     document_id: int
     document_uuid: str = ""
@@ -326,6 +337,7 @@ class SegmentFactsRequest(BaseModel):
     pages_text: str
     candidate_convenios: list[ConvenioCandidateBody] = []
     candidate_topics: list[VocabularyCandidateBody] = []
+    target_topic: VocabularyCandidateBody | None = None
     provider_api_key: str
     provider_config: ProviderConfigBody
 
@@ -958,8 +970,18 @@ def segment_facts(req: SegmentFactsRequest) -> JSONResponse:
             VocabularyCandidate(id=t.id, name=t.name, aliases=t.aliases, code=t.code)
             for t in req.candidate_topics
         ]
+        target_topic = (
+            VocabularyCandidate(
+                id=req.target_topic.id,
+                name=req.target_topic.name,
+                aliases=req.target_topic.aliases,
+                code=req.target_topic.code,
+            )
+            if req.target_topic is not None
+            else None
+        )
         result = provider.segment_facts(
-            req.pages_text, convenios, topics, req.provider_api_key, config
+            req.pages_text, convenios, topics, req.provider_api_key, config, target_topic
         )
         return JSONResponse({"facts": result.facts, "trace_fragment": result.trace_fragment})
     except Exception as exc:  # noqa: BLE001 - never echo the body (it carries the key)
