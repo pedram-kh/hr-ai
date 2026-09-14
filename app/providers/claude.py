@@ -700,6 +700,28 @@ SEGMENT_FACTS_SYSTEM_PROMPT = (
 # guards against a huge salary xlsx (the routing test wants ~zero facts anyway).
 SEGMENT_TEXT_CAP = 48000
 
+# Sprint 10c jornada gold-fixture eval (next checkpoint after CP-B) found this
+# INPUT cap silently truncating the topic-scoped path — a DIFFERENT, more
+# serious bug than the false-negative reasoning failure it first looked like.
+# Live measurement, convenio 25: TopicLexicon's 'jornada' anchor (the single
+# most promiscuous anchor in the lexicon — a bare, common word, unlike every
+# other topic's multi-word anchors) matched 31/86 pages (36% of the document),
+# concatenating to 91,487 chars — nearly double SEGMENT_TEXT_CAP's 48,000, so
+# the passage actually containing convenio 25's real "Artículo 33.- Jornada
+# Laboral" (page 45) was cut off entirely BEFORE reaching the model. Worse:
+# `segment_facts()`'s `truncated` trace key only ever reflected OUTPUT
+# truncation (`stop_reason == "max_tokens"`) — this INPUT truncation had NO
+# signal anywhere in the trace_fragment or logs, unlike `propose_groups()`'s
+# `text_truncated` key (PROPOSE_GROUPS_TEXT_CAP below), which already does
+# this correctly for its own path. A separate, larger cap (not touching
+# SEGMENT_TEXT_CAP/the original 7b-2 multi-province path, whose own real
+# inputs are tiny per the comment above) plus a real `text_truncated` trace
+# flag are both required here: 200,000 chars comfortably covers this eval's
+# worst case plus headroom for a still-larger convenio, at a marginal cost
+# (~$0.03/call more at $3/M input tokens) — trivial against silently losing
+# an entire dedicated article.
+TOPIC_SEGMENT_TEXT_CAP = 200000
+
 
 # --- Topic-parameterized segmentation (Sprint 10c, plan §A.1) --------------
 #
@@ -740,6 +762,192 @@ PREAVISO_DISAMBIGUATION_ES = (
     "persona trabajadora dimitiendo), NO es este topic: ignórala por completo."
 )
 
+# Sprint 10c permisos gold-fixture eval (run 1, plan §D.10) found this trap
+# LIVE, not just theoretically: convenios 2/20/25 all embed maternidad/
+# paternidad/lactancia content (statutory suspension-of-contract machinery —
+# 16 semanas, permiso parental, cuidado del lactante) inside or immediately
+# beside the very same "Permisos"/"Licencias retribuidas" article, anchored
+# on the same word ('permiso'/'licencia'). Structurally identical trap-shape
+# to D2's preaviso finding, just for a topic the plan's shallow §B.4 sample
+# had predicted would be easy.
+PERMISOS_DISAMBIGUATION_ES = (
+    "14. DEFINICIÓN ESTRICTA DE 'permisos retribuidos' (este topic SOLO "
+    "significa esto): las ausencias retribuidas de corta duración por motivos "
+    "puntuales del propio artículo de 'Permisos'/'Licencias retribuidas' del "
+    "convenio (matrimonio, fallecimiento, enfermedad grave de familiar, "
+    "traslado de domicilio, deber inexcusable, exámenes, consulta médica, "
+    "fuerza mayor familiar, etc.). NO es ninguna de las siguientes — NO emitas "
+    "ningún hecho para ellas, aunque compartan la palabra 'permiso'/'licencia' "
+    "o vivan en el mismo artículo o uno contiguo:\n"
+    "   a) cuidado del LACTANTE/lactancia (hora de ausencia o reducción de "
+    "jornada por hijo/a menor de 9-12 meses) — es su propio topic "
+    "('lactancia'), aunque el convenio lo numere como una letra más del mismo "
+    "artículo de permisos;\n"
+    "   b) SUSPENSIÓN del contrato por nacimiento, adopción, guarda con fines "
+    "de adopción o acogimiento (las 16 semanas y sus ampliaciones), ni el "
+    "PERMISO PARENTAL (art. 45.1.d) ni la ADAPTACIÓN DE JORNADA por cuidado — "
+    "es maternidad/paternidad, un topic distinto, aunque el convenio lo agrupe "
+    "en el mismo capítulo o título que los permisos retribuidos;\n"
+    "   c) permisos SIN SUELDO / licencias NO retribuidas — es el topic "
+    "'permisos no retribuidos', explícitamente distinto (verifica que el "
+    "pasaje diga 'retribuido'/'con derecho a remuneración', no 'sin sueldo');\n"
+    "   d) una remisión genérica sin desarrollo propio a una norma externa (p. "
+    "ej. 'el trabajador tiene derecho a los permisos del art. 23 ET' sin que "
+    "el convenio añada ninguna cifra o condición propia) — no hay hecho propio "
+    "del convenio que extraer; NO EMITAS NADA (no la conviertas en hecho de "
+    "baja confianza: si el convenio no dice nada específico, no hay nada que "
+    "proponer).\n"
+    "Si un pasaje mezcla contenido de permisos retribuidos CON contenido de "
+    "cualquiera de (a)-(d) en las mismas líneas, extrae ÚNICAMENTE la parte de "
+    "permisos retribuidos propiamente dicha en `value`/`raw_values` — nunca "
+    "arrastres la parte ajena solo porque venga en el mismo párrafo."
+)
+
+# Sprint 10c vacaciones gold-fixture eval (run 1, CP-B) found two topic-
+# boundary traps LIVE — a different SHAPE from permisos' lactancia leak (no
+# shared word triggers this one; it's purely document-structural):
+# (a) convenio 20's real "Vacaciones" article (Art. 25, flat 30 días
+#     naturales) sits immediately after a four-year DECLINING JORNADA-HOURS
+#     schedule (Art. 22) at a page-break where a running chapter header
+#     ("...VACACIONES") repeats — run-1 did not fabricate this trap, but the
+#     eval's own gold-set construction almost did (see
+#     eval/vacaciones/README.md's "Correction to plan.md §D.10"), and c.10's
+#     run-1 fact DID pull a bare jornada-hours figure ("Las horas anuales
+#     máximas de trabajo son 1.752") into its vacaciones value, from the same
+#     paragraph block with no heading in between;
+# (b) convenio 25's run-1 fact extracted a pure vacation-INTERRUPTION
+#     narrative (no day-count figure at all) that lives inside the
+#     nacimiento/maternidad suspension-of-contract article, not the dedicated
+#     "Artículo 36.- Vacaciones" — and this single mis-scoped proposal then
+#     silently overwrote (rule 3's new cross-passage-merge clause above is
+#     the general-purpose fix; this rule is the topic-specific negative
+#     definition, same two-part pattern as preaviso/permisos) the real,
+#     correctly-scoped vacaciones fact via the same logical-key collision.
+VACACIONES_DISAMBIGUATION_ES = (
+    "15. DEFINICIÓN ESTRICTA DE 'vacaciones' (este topic SOLO significa esto): "
+    "el número de días de vacaciones anuales retribuidas a que tiene derecho la "
+    "persona trabajadora (incluido su calendario multianual si lo hay) y las "
+    "reglas de disfrute/cómputo de ESE período (reparto empresa/trabajador, "
+    "fraccionamiento, mínimo consecutivo, período del año en que deben "
+    "disfrutarse, cómputo de festivos/fines de semana dentro del período). NO "
+    "es ninguna de las siguientes — NO emitas ningún hecho, ni arrastres estas "
+    "cifras dentro del `value` de un hecho de vacaciones, aunque aparezcan en "
+    "el mismo párrafo, el mismo artículo, o inmediatamente antes/después por "
+    "un salto de página o un encabezado de capítulo repetido:\n"
+    "   a) JORNADA (horas de trabajo al año, calendarios multianuales de horas "
+    "como '1.704 horas… 1.692 horas' o una cifra suelta como '1.752 horas "
+    "anuales máximas') — es el topic 'jornada', un tema distinto, aunque la "
+    "cifra de horas aparezca en el mismo bloque de texto que el número de días "
+    "de vacaciones o justo tras un encabezado de capítulo que mencione "
+    "'VACACIONES' (esto ha ocurrido de verdad: un encabezado de artículo puede "
+    "repetirse en un salto de página ANTES de que termine el contenido del "
+    "artículo anterior — verifica de qué artículo es CADA frase, no solo qué "
+    "encabezado la precede en el texto filtrado);\n"
+    "   b) la INTERRUPCIÓN o suspensión del disfrute de vacaciones por baja de "
+    "nacimiento/adopción/cuidado del menor (p. ej. 'si la persona trabajadora "
+    "está disfrutando vacaciones y causa baja por nacimiento, se interrumpe el "
+    "disfrute…') — es contenido del artículo de maternidad/paternidad/permisos, "
+    "no un hecho propio de vacaciones, y casi nunca lleva una cifra de días "
+    "propia (es un pasaje narrativo de mecánica procedimental, no una regla de "
+    "cuántos días corresponden); NO EMITAS NADA para él bajo este topic.\n"
+    "Si un pasaje mezcla el número de días de vacaciones CON contenido de (a) o "
+    "(b) en las mismas líneas, extrae ÚNICAMENTE la parte de vacaciones "
+    "propiamente dicha en `value`/`raw_values`."
+)
+
+
+# Sprint 10c jornada gold-fixture eval (run 1, next checkpoint after CP-B)
+# found a THIRD trap shape — not a boundary/leak like preaviso/permisos/
+# vacaciones (over-extraction), but the opposite: a FALSE NEGATIVE. Convenio
+# 25's dedicated "Artículo 33.- Jornada Laboral" (1750 horas/año) sits on a
+# page the passage filter DID include (verified live: truncated=false, the
+# full anchored page reached the model) — the failure is the model
+# concluding "no dedicated jornada article" when one genuinely exists.
+# Root cause, confirmed live: TopicLexicon::ANCHORS['jornada'] includes the
+# bare word 'jornada', the single most promiscuous anchor in the lexicon —
+# for c.25 it matched 31 of 86 pages (36% of the whole document), because
+# "jornada" appears constantly in UNRELATED clauses (reducción de jornada
+# por lactancia/guarda legal, adaptación de jornada por cuidado, excedencia,
+# vacaciones, jornada continuada's descanso). The model, faced with ~30
+# mostly-irrelevant passages, appears to pattern-match "no isolated jornada
+# figure sitting alone" and gives up instead of scanning for a dedicated
+# ARTICLE HEADING. This is a reasoning/recall failure, not a scope-boundary
+# one — the fix is an instruction to search structurally (by heading), not a
+# new negative-content definition.
+JORNADA_DISAMBIGUATION_ES = (
+    "16. BÚSQUEDA EXHAUSTIVA POR ENCABEZADO ANTES DE CONCLUIR AUSENCIA: los "
+    "pasajes filtrados para 'jornada' incluirán casi siempre MUCHAS menciones "
+    "incidentales de la palabra 'jornada' que NO son el artículo dedicado "
+    "(reducción de jornada por lactancia o guarda legal, adaptación de "
+    "jornada por cuidado, jornada dentro de una cláusula de excedencia o de "
+    "vacaciones, etc. — ninguna de ellas es este topic). Que la MAYORÍA de "
+    "los pasajes sean así NO significa que no exista un artículo dedicado: "
+    "antes de concluir que un convenio no tiene jornada general, revisa "
+    "TODOS los pasajes buscando específicamente un ENCABEZADO de artículo o "
+    "capítulo (p. ej. 'Artículo NN.- Jornada Laboral/de Trabajo/Máxima "
+    "Anual', 'CAPÍTULO … TIEMPO DE TRABAJO', 'Art. NN. JORNADA') que "
+    "introduzca una cifra de horas/año o horas/semana con carácter GENERAL "
+    "para el convenio o para un grupo — ese artículo, si aparece en CUALQUIER "
+    "pasaje filtrado, tiene prioridad sobre todas las menciones incidentales "
+    "y SIEMPRE debe convertirse en un hecho. Solo concluye ausencia genuina "
+    "(y emítelo como tal, con `uncertainty.field='value'` si quieres "
+    "señalarlo, nunca en silencio) si, tras revisar CADA pasaje filtrado, "
+    "ninguno contiene ese encabezado ni esa cifra general — no por simple "
+    "volumen de ruido alrededor."
+)
+
+
+# Sprint 10c festivos gold-fixture eval (build, next checkpoint after CP-3)
+# found the anchor itself ('festivos') is corpus-wide the WRONG kind of
+# promiscuous: unlike jornada's false-negative shape (real content exists,
+# buried in noise), most of the 6 eval convenios' 'festivos'-anchored
+# passages contain NO calendar-of-holidays content at all — every hit is a
+# "Plus de festivos" / "Plus de domingos y festivos" RETRIBUCIÓN clause (a
+# per-hour or per-day premium for WORKING on a festivo), which is a
+# different topic entirely. Live count: c.3/c.18/c.20/c.25's every anchored
+# passage was retribución-only; only c.2 (a real "mínimo dos días festivos
+# anuales… 1 de enero y 25 de diciembre" closure-days rule inside "Artículo
+# 27. Descanso semanal y festivos") and c.10 (a real "Días de libranza
+# adicionales: 24 y 31 de diciembre y el Sábado Santo" rule inside a jornada
+# article) had genuine in-topic content. This is a restraint problem, not a
+# recall one — the risk is the model mistaking "the 14 official festivos
+# fixed annually" (a plus-eligibility definition, no dates, no day-count
+# grant) or a euro amount for a festivos FACT.
+FESTIVOS_DISAMBIGUATION_ES = (
+    "17. DEFINICIÓN ESTRICTA DE 'festivos' (este topic SOLO significa esto): "
+    "el NÚMERO o CALENDARIO de días festivos/de cierre a que tiene derecho la "
+    "persona trabajadora por encima o al margen del calendario laboral "
+    "oficial (p. ej. 'un mínimo de dos días festivos anuales, el 1 de enero y "
+    "el 25 de diciembre, de cierre de la instalación' o 'los días 24 y 31 de "
+    "diciembre y el Sábado Santo se considerarán de libranza para el "
+    "personal') — es decir, CUÁNTOS días son y/o CUÁLES son. NO es ninguna de "
+    "las siguientes, aunque comparta la palabra 'festivo(s)' o aparezca en el "
+    "mismo artículo o párrafo — NO emitas ningún hecho para ellas bajo este "
+    "topic:\n"
+    "   a) CUALQUIER 'Plus de festivos', 'Plus de domingos y festivos', 'Plus "
+    "de festivos de especial significación' o similar — es una prima "
+    "RETRIBUTIVA por trabajar en festivo (euros/hora, euros/día, o un "
+    "porcentaje), no un hecho sobre qué días son festivos ni cuántos hay. Es "
+    "el topic 'retribución', no este.\n"
+    "   b) una definición de 'festivo' que exista ÚNICAMENTE para acotar el "
+    "alcance de un plus retributivo (p. ej. 'tendrán la consideración de "
+    "festivos a los efectos de lo establecido en este artículo, "
+    "exclusivamente los 14 festivos oficiales fijados anualmente') — remite "
+    "al calendario laboral oficial externo (no listado aquí) y su único "
+    "propósito es delimitar CUÁNDO se paga el plus de (a); no otorga ni "
+    "cuenta días propios del convenio. Si el pasaje NO da un número o "
+    "calendario de días de cierre/libranza PROPIOS del convenio (más allá de "
+    "remitir al calendario oficial), NO hay hecho que emitir.\n"
+    "   c) compensación por trabajar en domingo/festivo en forma de horas de "
+    "descanso (p. ej. '1,75 horas de descanso por cada hora trabajada en "
+    "festivo') — es jornada/retribución, no festivos.\n"
+    "La mayoría de los pasajes filtrados para este topic en este corpus son "
+    "de tipo (a)/(b)/(c); que NINGÚN pasaje contenga un número o calendario "
+    "propio de días de cierre es un resultado genuino y correcto — devuelve "
+    "`facts` vacío en ese caso, no fuerces un hecho a partir de una cifra en "
+    "euros o de una remisión al calendario oficial."
+)
+
 
 def _build_topic_segment_system_prompt(target_topic_name: str) -> str:
     """The topic-driven system prompt (Sprint 10c). Single-convenio, passage-
@@ -747,9 +955,28 @@ def _build_topic_segment_system_prompt(target_topic_name: str) -> str:
     1/2/3/4/5/7/8/9/10/11 are the SAME restraint architecture 7b-2 proved (the
     eval was the deliverable there; reused, not rebuilt, here). Rule 3 gets an
     explicit multi-year-schedule clarification (D5 — a real corpus shape,
-    plan §B.4's c.20 pattern) that the original prompt never needed to state."""
+    plan §B.4's c.20 pattern) that the original prompt never needed to state.
+    Rule 16 (jornada only) is the first RECALL/false-negative fix in this
+    tranche, as opposed to rules 13/14/15's scope-boundary/over-extraction
+    fixes — see JORNADA_DISAMBIGUATION_ES's comment for the live finding.
+    Rule 17 (festivos only) is back to a restraint/over-extraction fix, but
+    an unusually strong one: MOST of this topic's anchored passages
+    corpus-wide are the WRONG topic entirely (retribución premiums for
+    working a festivo, not a calendar of festivo days) — see
+    FESTIVOS_DISAMBIGUATION_ES's comment for the live finding."""
     topic_lower = target_topic_name.strip().lower()
-    extra_rule = "\n" + PREAVISO_DISAMBIGUATION_ES if topic_lower == "preaviso" else ""
+    if topic_lower == "preaviso":
+        extra_rule = "\n" + PREAVISO_DISAMBIGUATION_ES
+    elif topic_lower in ("permisos", "permisos retribuidos"):
+        extra_rule = "\n" + PERMISOS_DISAMBIGUATION_ES
+    elif topic_lower == "vacaciones":
+        extra_rule = "\n" + VACACIONES_DISAMBIGUATION_ES
+    elif topic_lower == "jornada":
+        extra_rule = "\n" + JORNADA_DISAMBIGUATION_ES
+    elif topic_lower == "festivos":
+        extra_rule = "\n" + FESTIVOS_DISAMBIGUATION_ES
+    else:
+        extra_rule = ""
     return (
         "Eres un agente de segmentación documental para una plataforma de RR. HH. "
         "que gestiona convenios colectivos españoles. Recibes PASAJES ya "
@@ -775,14 +1002,43 @@ def _build_topic_segment_system_prompt(target_topic_name: str) -> str:
         "del Estatuto de los Trabajadores que NO coincide con ningún convenio de "
         "la lista, NO fuerces un convenio: omite el hecho o emítelo con "
         "`uncertainty.field='scope'`. Mejor marcar incierto que adivinar.\n"
-        "3. UN HECHO POR ÁMBITO (valores múltiples y CALENDARIOS MULTIANUALES): un "
-        "bloque de un grupo es UN hecho, aunque su desglose ocupe varias líneas "
-        "(p. ej. tipos de contrato, o un calendario de varios años como 'Año "
-        "2025: 1637 horas… Año 2028: 1628 horas'). Mete el desglose COMPLETO en "
-        "`value` y en `raw_values` — NO crees un hecho por año ni por tipo de "
-        "contrato (regla 8: nunca propongas fechas de vigencia; un calendario "
-        "multianual dentro de la vigencia del documento fuente es UN hecho). El "
-        "ÁMBITO es la unidad consultable; el desglose vive dentro.\n"
+        "3. UN HECHO POR ÁMBITO (valores múltiples, CALENDARIOS MULTIANUALES Y "
+        "ARTÍCULOS DE LISTA ENUMERADA): un bloque de un grupo es UN hecho, aunque "
+        "su desglose ocupe varias líneas (p. ej. tipos de contrato, o un "
+        "calendario de varios años como 'Año 2025: 1637 horas… Año 2028: 1628 "
+        "horas'). Esto incluye EXPLÍCITAMENTE un artículo que enumera varios "
+        "supuestos/motivos distintos con letras o números (a, b, c… / 1, 2, 3…) "
+        "que en conjunto regulan el tema objetivo para este convenio (el patrón "
+        "más común de 'permisos'/'licencias retribuidas': matrimonio, "
+        "fallecimiento, traslado de domicilio, deber inexcusable, etc., cada uno "
+        "con su propio número de días): SI ninguno de esos supuestos varía por "
+        "grupo/categoría profesional, son TODOS UN SOLO hecho convenio-wide, NO "
+        "un hecho por supuesto/letra/número. Mete el desglose COMPLETO (cada "
+        "motivo con su propia clave y detalle) en `value` (legible, motivo por "
+        "motivo) y en `raw_values` (estructurado, una clave por motivo) — NO "
+        "crees un hecho por año, por tipo de contrato, NI por motivo/supuesto de "
+        "una lista enumerada (regla 8: nunca propongas fechas de vigencia; un "
+        "calendario multianual o una lista de motivos dentro de la vigencia del "
+        "documento fuente es UN hecho). El ÁMBITO es la unidad consultable; el "
+        "desglose entero vive dentro. Un motivo SOLO se convierte en un hecho "
+        "aparte si de verdad tiene su propio `group_label` distinto (varía por "
+        "grupo/categoría) — la mera pertenencia a letras/números distintos del "
+        "mismo artículo NUNCA basta por sí sola para separar hechos. ESTO SE "
+        "APLICA IGUAL SI EL CONTENIDO DEL MISMO ÁMBITO/TEMA APARECE EN MÁS DE UN "
+        "PASAJE: si los PASAJES FILTRADOS incluyen, además del artículo "
+        "principal, una mención secundaria en otro artículo o capítulo distinto "
+        "que también regula (aunque sea de pasada) el MISMO tema para el MISMO "
+        "ámbito, FUSIONA ese contenido dentro del MISMO hecho único — nunca "
+        "propongas un segundo hecho independiente para el pasaje secundario. "
+        "Confirmado en producción (sprint 10c, dos topics distintos, tres "
+        "convenios distintos): la persistencia solo guarda UN hecho por "
+        "ámbito/tema/documento, así que un segundo hecho propuesto para el "
+        "mismo ámbito SOBRESCRIBE SIN AVISO al primero — la revisión humana ve "
+        "una sola fila y no tiene forma de saber que una segunda propuesta "
+        "borró la primera. Ante la duda de si dos pasajes son 'el mismo tema', "
+        "prefiere fusionar, nunca dupliques: un hecho con desglose de más no "
+        "hace daño; dos hechos que colisionan destruyen el primero en "
+        "silencio.\n"
         "4. group_label OBLIGATORIO cuando el contenido varíe por grupo: devuelve "
         "SIEMPRE el grupo TAL CUAL aparece ('Grupo 1', 'Grupo 2 (resto áreas)', "
         "'Obreros y subalternos'). Es el discriminador de identidad del hecho. Si "
@@ -836,14 +1092,18 @@ def _build_topic_segment_prompt(
     pages_text: str,
     candidate_convenios: list[ConvenioCandidate],
     target_topic: VocabularyCandidate,
-) -> str:
-    """User prompt for the topic-driven path (Sprint 10c). Same text cap as
-    the original (SEGMENT_TEXT_CAP) — passage-scoped input is already far
-    smaller than a full convenio (plan §B.5), so this is a defensive ceiling,
-    not the primary sizing mechanism (that's the caller's anchor-filtering)."""
+) -> tuple[str, bool]:
+    """User prompt for the topic-driven path (Sprint 10c). Uses
+    TOPIC_SEGMENT_TEXT_CAP, NOT the original SEGMENT_TEXT_CAP (found live,
+    jornada eval — see that constant's comment: a broad anchor's
+    passage-scoped set can exceed the original 48k cap for real, so this
+    path needs its own, larger ceiling). Returns (prompt, text_truncated) so
+    the caller can put a REAL input-truncation signal in trace_fragment —
+    previously absent entirely (the existing `truncated` key is output-only)."""
     text = (pages_text or "").strip()
-    if len(text) > SEGMENT_TEXT_CAP:
-        text = text[:SEGMENT_TEXT_CAP] + "\n…[texto truncado]"
+    text_truncated = len(text) > TOPIC_SEGMENT_TEXT_CAP
+    if text_truncated:
+        text = text[:TOPIC_SEGMENT_TEXT_CAP] + "\n…[texto truncado]"
     blocks = [
         f"PASAJES FILTRADOS DEL CONVENIO (tema: '{target_topic.name}'):",
         text,
@@ -861,7 +1121,7 @@ def _build_topic_segment_prompt(
             "JSON."
         ),
     ]
-    return "\n".join(blocks)
+    return "\n".join(blocks), text_truncated
 
 
 def _convenio_candidate_block(convenios: list[ConvenioCandidate]) -> str:
@@ -1673,10 +1933,15 @@ class ClaudeProvider(AnswerProvider):
         client = anthropic.Anthropic(api_key=api_key, base_url=config.endpoint or None)
         if target_topic is not None:
             system_prompt = _build_topic_segment_system_prompt(target_topic.name)
-            user_prompt = _build_topic_segment_prompt(pages_text, candidate_convenios, target_topic)
+            user_prompt, text_truncated = _build_topic_segment_prompt(pages_text, candidate_convenios, target_topic)
         else:
             system_prompt = SEGMENT_FACTS_SYSTEM_PROMPT
             user_prompt = _build_segment_prompt(pages_text, candidate_convenios, candidate_topics)
+            # Original 7b-2 path: same cap it always had (SEGMENT_TEXT_CAP,
+            # untouched) — computed here, not inside _build_segment_prompt,
+            # purely so both paths report the SAME trace_fragment key below
+            # without changing that function's (unrelated, unmodified) signature.
+            text_truncated = len((pages_text or "").strip()) > SEGMENT_TEXT_CAP
 
         started = time.monotonic()
         # A multi-province periodo file yields ~30-50 verbose facts of JSON; the
@@ -1717,6 +1982,7 @@ class ClaudeProvider(AnswerProvider):
                         # genuinely malformed stream; stop_reason/completion_tokens
                         # give the same detail the other seven enriched sites do.
                         "truncated": truncated,
+                        "text_truncated": text_truncated,
                         "stop_reason": getattr(resp, "stop_reason", None),
                         "completion_tokens": getattr(resp.usage, "output_tokens", None) if getattr(resp, "usage", None) else None,
                     },
@@ -1802,6 +2068,7 @@ class ClaudeProvider(AnswerProvider):
                 "completion_tokens": getattr(resp.usage, "output_tokens", None),
                 "fact_count": len(facts),
                 "truncated": truncated,
+                "text_truncated": text_truncated,
                 "salvaged": salvaged,
             },
         )
