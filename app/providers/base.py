@@ -399,6 +399,7 @@ class AnswerProvider(ABC):
         candidate_topics: list[VocabularyCandidate],
         api_key: str,
         config: ProviderConfig,
+        target_topic: VocabularyCandidate | None = None,
     ) -> SegmentedFactsResult:
         """Read a multi-scope reference_source's text and SEGMENT it into per-
         scope facts (Sprint 7b-2, ADR-0022). THE load-bearing instruction is
@@ -409,7 +410,14 @@ class AnswerProvider(ABC):
         candidate list (never invents). One fact per scope (multi-value breakdown
         inside `value`/`raw_values`). A strict, inert proposer — it returns
         suggestions, writes nothing, proposes no validity/authority, and flags
-        uncertainty rather than guessing scope."""
+        uncertainty rather than guessing scope.
+
+        `target_topic` (Sprint 10c, plan §A.1): when given, this call is FOR
+        ONE TOPIC ONLY — the topic-parameterized, single-convenio, passage-
+        scoped path (no header-carry needed: the caller already knows which
+        convenio this text belongs to). When None, behavior is byte-for-byte
+        identical to the original 7b-2 `reference_source` path (hardcoded to
+        `periodo de prueba`, opportunistic `candidate_topics` binding)."""
         raise NotImplementedError
 
     @abstractmethod
