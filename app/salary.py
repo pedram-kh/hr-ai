@@ -356,10 +356,51 @@ def _parse_sheet(name: str, rows: list[list]) -> tuple[dict | None, list[str], d
         first_money = min(numeric_cols) if numeric_cols else width
     label_cols = list(range(first_money))
 
+    def _is_data_row(r) -> bool:
+        return any(c < len(r) and _is_number(r[c]) for c in range(first_money, width))
+
+    # Whether a column holds monthly or annual figures is a property of the
+    # COLUMN, not of any one row — so it is decided here, once, before a single
+    # row is typed. The row-level guard below (`_monthly_under_annual`) cannot
+    # settle it alone: on COEAS Andalucía's sheets the bare `SB` column holds
+    # annuals throughout, but the five rows carrying a `COMP.`/`Comp. SMI`
+    # top-up have SB < TOTAL, so a per-row test passes on exactly those rows and
+    # files an annual as a monthly for them (measured 2026-09-16: the row test
+    # caught 22 of 27 rows and missed 5, e.g. `Mediador/a Intercultural
+    # Educativo`, SB 17.411,25 vs TOTAL 17.847,05, whose real monthly 1.243,66
+    # sits in the adjacent bare `14` column). Reading the column as a whole is
+    # what makes those rows decidable: the majority verdict is the column's
+    # meaning, and it governs every row including the innocent-looking ones.
+    if monthly_idx is not None:
+        annual_idx = next((c for c, f in field_map.items() if f == "gross_annual"), None)
+        if annual_idx is not None:
+            comparable = not_below = 0
+            for r in data:
+                if not _is_data_row(r):
+                    continue
+                m = _to_float(r[monthly_idx]) if monthly_idx < len(r) else None
+                a = _to_float(r[annual_idx]) if annual_idx < len(r) else None
+                if m is None or a is None:
+                    continue
+                comparable += 1
+                not_below += m >= a
+            if comparable and not_below * 2 > comparable:
+                warnings.append(
+                    f"sheet '{name}': the column headed '{monthly_label}' is not below "
+                    f"'{_verbatim(rows[header_idx], annual_idx)}' on {not_below} of {comparable} rows — it "
+                    "holds ANNUAL figures in this workbook, not a monthly base: base_salary_monthly left "
+                    "NULL for EVERY row of this sheet (every figure stays verbatim in raw_values, and the "
+                    "annual is stated on its own rather than a monthly the source never printed)"
+                )
+                field_map = {c: f for c, f in field_map.items() if f != "base_salary_monthly"}
+                monthly_idx = None
+                monthly_label = None
+                diagnostic["typed_fields"] = sorted(set(field_map.values()))
+
     out_rows = []
     for r in data:
         # A data row must carry at least one numeric value in the grid.
-        if not any(c < len(r) and _is_number(r[c]) for c in range(first_money, width)):
+        if not _is_data_row(r):
             continue
         # Label columns → group_code (leftmost) + job_category_name (rightmost),
         # skipping genuinely empty cells (never the literal string "None").
@@ -423,10 +464,40 @@ def _parse_sheet(name: str, rows: list[list]) -> tuple[dict | None, list[str], d
             )
             return None
 
+        def _monthly_under_annual(monthly_value, annual_value, name_for_warning):
+            # A monthly base that equals or exceeds its own row's annual is not a
+            # monthly, whatever the header calls it. The header-synonym set has to
+            # decide by label alone, and the same label means different quantities
+            # in different workbooks: COEAS Estatal heads its annual base "SB
+            # Anual" (correctly read as raw, not monthly), while COEAS Andalucía
+            # heads the SAME quantity bare "SB" — which `_MONTHLY` matches, so the
+            # annual would be typed as the monthly (22.058,76 stored as a monthly
+            # base whose real value, 1.575,63, sits in the adjacent column). Found
+            # live 2026-09-16 binding that file to convenio 4.
+            #
+            # This is not the derived-figure failure of Correction-salary-01 —
+            # nothing is computed — but it lands in the same column with the same
+            # consequence, and `salary:audit-monthly` cannot catch it: the figure
+            # IS a real source cell present in raw_values, so the audit's
+            # "does a source cell back this?" test passes. The arithmetic
+            # relationship between two typed cells on one row is the only signal
+            # that survives a mislabelled header, so it is checked here.
+            if monthly_value is None or annual_value is None or monthly_value < annual_value:
+                return monthly_value
+            warnings.append(
+                f"sheet '{name}': base_salary_monthly={monthly_value!r} is not below "
+                f"gross_annual={annual_value!r} for '{name_for_warning}' — the column headed "
+                f"'{monthly_label}' holds an ANNUAL figure in this workbook, not a monthly base: "
+                "kept in raw_values only, base_salary_monthly left NULL (the annual is stated "
+                "instead, never a derived monthly)"
+            )
+            return None
+
         gross = _bounded("gross_annual", gross)
         # NEVER derived (Correction-salary-01): the monthly figure is whatever
         # the source's own monthly column says, or NULL.
         base_monthly = _bounded("base_salary_monthly", monthly)
+        base_monthly = _monthly_under_annual(base_monthly, gross, job_category_name)
         extra = _bounded("extra_pay", extra)
         hourly = _bounded("hourly_rate", hourly)
         night = _bounded("night_plus", night)
