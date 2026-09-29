@@ -26,6 +26,9 @@ retrieval substrate:
                publish fence is a safety gate; a post-top-k authority filter
                could hide the one overlapping passage — a fail-open). No LLM,
                no write, no migration.
+- `/plan` — Sprint 13 (plan.md §C.7): one planner round via native Anthropic
+               tool use (`tool_choice: any`, thinking disabled, no temperature).
+               hr-backend decides and writes; this endpoint only returns tool calls.
 - `/synthesise` — Sprint 2b-1 (ADR-0015): compose a CITED answer grounded ONLY
                in the eligible chunks hr-backend passes, honouring the
                convenio-over-baseline precedence rule. The provider is pluggable
@@ -229,12 +232,62 @@ class ExplainRequest(BaseModel):
     provider_config: ProviderConfigBody
 
 
+class GeneralLaneSourceBody(BaseModel):
+    """One curated catalogue entry (hr-backend `config/hr.php`
+    `general_lane.sources`). The model NEVER invents a URL — it only sees the
+    `id`/`title`/`topics` (via `select_sources`'s local match, no extra model
+    call is even needed to pick candidates); `url` is used ONLY server-side by
+    the fetcher, never sent to the provider."""
+
+    id: str
+    url: str
+    title: str
+    topics: list[str] = []
+
+
+class GeneralKnowledgeRequest(BaseModel):
+    """Sprint 13, step 9 (plan.md §B.6.5) — the `general_knowledge` lane.
+
+    `question_scrubbed` has ALREADY had PII removed by hr-backend's
+    `PiiScrubber` — this service re-checks the pattern-level part as defence
+    in depth (`app/general_lane.py::refuse_if_pii`) and refuses the call if
+    any is still present. `allowed_domains` + `catalogue` are hr-backend-owned
+    config (`config/hr.php`), passed per call rather than duplicated here so
+    there is exactly one place curators edit the list."""
+
+    question_scrubbed: str
+    allowed_domains: list[str] = []
+    catalogue: list[GeneralLaneSourceBody] = []
+    provider_api_key: str
+    provider_config: ProviderConfigBody
+
+
 class RouteRequest(BaseModel):
     """Router classification (Sprint 2b-2, ADR-0016). Sees the QUESTION only —
     never the chunks (the same privacy posture as /synthesise). The provider_config
     carries the SMALL/FAST router model. The key is hr-backend-owned, per call."""
 
     question: str
+    provider_api_key: str
+    provider_config: ProviderConfigBody
+
+
+class PlanRequest(BaseModel):
+    """Sprint 13, build step 6 (plan.md §C.7–C.10) — one planner round.
+
+    Native Anthropic tool use. The key is hr-backend-owned, per call, never
+    stored. `enabled_tools` is a list of names from this service's
+    `app/planner/tools.py` allowlist; unknown names are ignored. Scope,
+    window and prior_steps are already PII-scrubbed by hr-backend
+    (`ScopeSummaryBuilder` / `WindowBuilder`) — this endpoint does not
+    see name/email/uuid.
+    """
+
+    question: str
+    scope_summary: dict = {}
+    window: dict = {}
+    enabled_tools: list[str]
+    prior_steps: list = []
     provider_api_key: str
     provider_config: ProviderConfigBody
 
@@ -434,6 +487,11 @@ async def health_config() -> dict[str, object]:
         # provider_config used per /ocr-page call, so this is a visibility
         # default only (matching answer_model/router_model's own role here).
         "ocr_model": settings.ocr_model,
+        # Planner (Sprint 13, plan.md §C.7) — its own knob, never aliased to
+        # answer_model. Display value only; the per-call model arrives as
+        # provider_config.model from hr-backend.
+        "planner_model": settings.planner_model,
+        "planner_endpoint": settings.planner_endpoint or settings.answer_endpoint,
     }
 
 
@@ -785,6 +843,101 @@ def explain(req: ExplainRequest) -> JSONResponse:
         return JSONResponse({"answer": result.answer, "trace_fragment": result.trace_fragment})
     except Exception as exc:  # noqa: BLE001 - provider/parse failure → fallback
         # NEVER include the request body (it carries the key). Only the message.
+        return JSONResponse({"error": "provider_error", "detail": str(exc)}, status_code=200)
+
+
+@app.post("/general-knowledge", dependencies=[Depends(require_internal_token)])
+def general_knowledge(req: GeneralKnowledgeRequest) -> JSONResponse:
+    """Explain a labour-law CONCEPT in general terms (Sprint 13, step 9,
+    plan.md §B.6.5) — never a figure, a duration, or a concrete entitlement
+    (hr-backend's `GeneralLanePostCheck` re-verifies this deterministically
+    and discards any answer that slips past this endpoint's own prompt).
+
+    Fetches at most `general_lane.MAX_FETCHES` allowlisted catalogue pages
+    (SSRF-safe: https-only, public-IP-only, no auto-redirect-follow, capped
+    body/text size — see `app/general_lane.py::fetch_source`), selected
+    LOCALLY by keyword overlap against `question_scrubbed`'s own topics — the
+    model never picks or invents a URL. If no catalogue entry matches, or
+    every fetch fails, the answer falls back to the model's own general
+    knowledge with `sources=[{"kind": "model_knowledge", ...}]`.
+
+    Same failure discipline as `/explain`/`/synthesise`: on a PII-refusal,
+    provider, or parse failure this returns 200 with
+    `{"error": "provider_error", ...}` (the key — and the raw question — is
+    never echoed) so hr-backend's tool treats it as NO_MATERIAL.
+    """
+    from .general_lane import fetch_source, matching_topics, select_sources
+    from .providers import GeneralKnowledgeResult, ProviderConfig, get_provider
+
+    try:
+        catalogue = [s.model_dump() for s in req.catalogue]
+        candidates = select_sources(req.question_scrubbed, catalogue)
+
+        fetches: list[dict] = []
+        excerpts: list[dict] = []
+        for entry in candidates:
+            fetched = fetch_source(
+                entry["url"],
+                req.allowed_domains,
+                topics=[str(t) for t in entry.get("topics", [])],
+                priority_topics=matching_topics(req.question_scrubbed, entry),
+            )
+            fetches.append({
+                "url": fetched.url,
+                "status": fetched.status,
+                "bytes": fetched.bytes,
+                "ms": fetched.ms,
+                "error": fetched.error,
+                "text_chars": fetched.text_chars,
+                "windows": fetched.windows,
+                "excerpt_chars": len(fetched.text),
+                "matched_terms": fetched.matched_terms,
+            })
+            if fetched.text:
+                excerpts.append({"id": entry["id"], "title": entry["title"], "text": fetched.text})
+
+        provider = get_provider(req.provider_config.provider)
+        config = ProviderConfig(
+            provider=req.provider_config.provider,
+            model=req.provider_config.model,
+            endpoint=req.provider_config.endpoint,
+        )
+        result: GeneralKnowledgeResult = provider.general_knowledge(
+            req.question_scrubbed, excerpts, req.provider_api_key, config,
+        )
+        return JSONResponse({
+            "answer": result.answer,
+            "sources": result.sources,
+            "trace_fragment": {**result.trace_fragment, "fetches": fetches},
+        })
+    except Exception as exc:  # noqa: BLE001 - PII refusal/provider/parse failure → fallback
+        # NEVER include the request body (it carries the key AND the question).
+        return JSONResponse({"error": "provider_error", "detail": str(exc)}, status_code=200)
+
+
+@app.post("/plan", dependencies=[Depends(require_internal_token)])
+def plan_turn(req: PlanRequest) -> JSONResponse:
+    """One planner round (Sprint 13, plan.md §C.7–C.10).
+
+    Native tool use, `tool_choice: any`, thinking disabled, no `temperature`
+    parameter. On a provider/parse failure this returns 200 with
+    `{ "error": "provider_error", ... }` so hr-backend can fall back to
+    classic (§F.10) — never a guessed tool call.
+    """
+    from .planner.plan import plan
+
+    try:
+        result = plan(
+            question=req.question,
+            scope_summary=req.scope_summary,
+            window=req.window,
+            enabled_tools=req.enabled_tools,
+            prior_steps=req.prior_steps,
+            api_key=req.provider_api_key,
+            provider_config=req.provider_config.model_dump(),
+        )
+        return JSONResponse(result)
+    except Exception as exc:  # noqa: BLE001 - never echo the body (it carries the key)
         return JSONResponse({"error": "provider_error", "detail": str(exc)}, status_code=200)
 
 

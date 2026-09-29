@@ -85,6 +85,26 @@ class ExplainResult:
 
 
 @dataclass
+class GeneralKnowledgeResult:
+    """What a provider returns for one `/general-knowledge` call (Sprint 13,
+    plan.md §B.6.5). NOT a `SynthesisResult`: there is no citation contract
+    against retrieved corpus chunks — the "sources" here are either a fetched
+    catalogue excerpt (`kind='web'`) or nothing at all (`kind='model_knowledge'`,
+    the model's own training knowledge, no source to name).
+
+    `answer` is deliberately short (the prompt caps it at ~120 words) and
+    purely explanatory — no figures, no durations, no entitlement language;
+    hr-backend's `GeneralLanePostCheck` re-verifies this deterministically
+    (never trusts the prompt alone), and only a `kind='web'` answer is ever
+    surfaced in v1 (hr-backend's own §F.8 default — see `GeneralKnowledgeTool`
+    docblock)."""
+
+    answer: str
+    sources: list[dict] = field(default_factory=list)
+    trace_fragment: dict = field(default_factory=dict)
+
+
+@dataclass
 class GroundChunk:
     """One CITED chunk passed to the per-claim grounding check (Sprint 2b-2, §5).
 
@@ -349,6 +369,30 @@ class AnswerProvider(ABC):
         time by hr-backend's no-new-claims guard, so the AI paragraph never
         survived in practice. `api_key` is used for this one call and never
         persisted (same discipline as every other provider call)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def general_knowledge(
+        self,
+        question_scrubbed: str,
+        excerpts: list[dict],
+        api_key: str,
+        config: ProviderConfig,
+    ) -> GeneralKnowledgeResult:
+        """Explain a labour-law CONCEPT in general terms — never a figure, a
+        duration, or a concrete entitlement of the caller's own (Sprint 13,
+        plan.md §B.6.5). `question_scrubbed` has already had PII removed by
+        hr-backend's `PiiScrubber`; this method re-checks the pattern-level
+        part as defence in depth and MUST refuse (raise) if any is still
+        present — it never sends a PII-bearing question to the provider.
+
+        `excerpts` are fetched catalogue page text (`[{id, title, text}]`,
+        already capped to ~20k chars total) — never the raw question in a
+        URL, never anything the caller didn't already fetch server-side. When
+        `excerpts` is empty the answer comes from the model's own training
+        knowledge (`sources=[{kind:'model_knowledge', title}]` in the
+        result); when non-empty, the answer must draw ONLY from them
+        (`sources=[{kind:'web', id, title}]`, one per excerpt actually used)."""
         raise NotImplementedError
 
     @abstractmethod

@@ -25,6 +25,7 @@ from .base import (
     ChunkInput,
     ConvenioCandidate,
     ExplainResult,
+    GeneralKnowledgeResult,
     GroundChunk,
     GroundingResult,
     GroupProposalResult,
@@ -109,7 +110,16 @@ SYSTEM_PROMPT = (
     "citarse. Si la persona pregunta por una cantidad que las fuentes no enuncian "
     "tal cual, di qué cantidad SÍ consta y omite la calculada (ADR-0027: una cifra "
     "es una celda de origen o no se da).\n"
-    "8. Responde en el MISMO idioma que la pregunta.\n\n"
+    "8. Responde en el MISMO idioma que la pregunta.\n"
+    "9. ABRE DESDE LAS FUENTES, NO CON UNA DEFINICIÓN. La primera frase (y cada frase) "
+    "enuncia lo que una fuente dice sobre el tema —la regla, el derecho, la condición, "
+    "el plazo—, con su [Fuente N]. NO abras con una definición o explicación general "
+    "del concepto ni con una frase de encuadre («La excedencia es una situación en la "
+    "que…», «X consiste en…», «existen distintas modalidades…») que ninguna fuente "
+    "enuncie con esas palabras: una frase de encuadre sin fuente no se puede "
+    "comprobar y hace que se descarte la respuesta entera. Si una fuente sí define el "
+    "concepto, cita esa definición tal cual; si no, empieza directamente por el "
+    "primer dato que las fuentes sí contienen.\n\n"
     "FORMATO DE SALIDA: devuelve EXCLUSIVAMENTE un objeto JSON válido, sin texto "
     "alrededor, con esta forma:\n"
     '{"answer": "<respuesta con marcadores [Fuente N], o nota de abstención>", '
@@ -147,6 +157,8 @@ def _build_user_prompt(question: str, chunks: list[ChunkInput]) -> str:
         "[Fuente N] indique la procedencia — no escribas frases sobre de qué documento "
         "procede un dato. CADA afirmación sustantiva lleva su propio [Fuente N]; si "
         "ninguna fuente la respalda, OMÍTELA (no enuncies datos que no puedas citar). "
+        "Empieza por lo que dicen las fuentes, sin definición ni frase de encuadre "
+        "propias. "
         "Responde en el idioma de la pregunta y devuelve solo el JSON."
     )
     return "\n".join(lines)
@@ -1307,6 +1319,44 @@ EXPLAIN_SYSTEM_PROMPT = (
 )
 
 
+# Sprint 13, step 9 (plan.md §B.6.5). Deliberately its OWN prompt, never
+# SYSTEM_PROMPT (the citation contract) or EXPLAIN_SYSTEM_PROMPT (a verbatim
+# restatement of ALREADY-VERIFIED facts — this is either a fetched, UNVERIFIED
+# web excerpt or the model's own general knowledge, neither of which is
+# "verified facts", so reusing that contract's wording would be misleading).
+# The ABSOLUTE ban on figures/durations/entitlement language is the load-
+# bearing rule here: `GeneralLanePostCheck` (hr-backend) re-verifies this
+# deterministically and discards any answer that slips past the prompt, but
+# the prompt is the first line of defence and is written to make a figure-
+# bearing answer as unnatural as possible for the model to produce.
+GENERAL_KNOWLEDGE_SYSTEM_PROMPT = (
+    "Eres un/a asistente que EXPLICA conceptos de derecho laboral español en "
+    "términos generales a una persona empleada. NO conoces el caso concreto de "
+    "quien pregunta: no sabes su convenio, su categoría, su antigüedad ni "
+    "ningún dato suyo, y NUNCA debes inventarlos ni suponerlos.\n\n"
+    "REGLAS ABSOLUTAS:\n"
+    "1. Explica ÚNICAMENTE qué ES el concepto (una definición, en qué "
+    "consiste, para qué sirve). PROHIBIDO cualquier cifra, número, plazo, "
+    "duración, porcentaje, cantidad de dinero o fecha — ni siquiera como "
+    "ejemplo ilustrativo, ni siquiera aproximado.\n"
+    "2. PROHIBIDO decir o dar a entender que la persona TIENE DERECHO A algo, "
+    "que le CORRESPONDE algo, o que la empresa DEBE darle algo. Eso depende de "
+    "su convenio y de su caso concreto, que tú no conoces. Habla siempre en "
+    "términos generales e impersonales (evita \"tú\"/\"tienes\").\n"
+    "3. Si te doy EXTRACTOS de páginas oficiales, usa ÚNICAMENTE lo que dicen "
+    "esos extractos — no añadas nada de tu conocimiento general — e indica en "
+    "\"sources_used\" los identificadores de los extractos que realmente "
+    "usaste. Si NO te doy extractos, responde con tu conocimiento general "
+    "sobre el concepto (definición neutra, sin cifras) y deja \"sources_used\" "
+    "como una lista vacía.\n"
+    "4. Máximo 120 palabras. Un párrafo, sin markdown, sin listas.\n"
+    "5. Responde en español.\n\n"
+    "FORMATO DE SALIDA: devuelve EXCLUSIVAMENTE un objeto JSON válido, sin "
+    "texto alrededor ni backticks, con esta forma exacta: "
+    '{"answer": "<párrafo>", "sources_used": ["<id>", ...]}'
+)
+
+
 class ClaudeProvider(AnswerProvider):
     def synthesise(
         self,
@@ -1561,6 +1611,104 @@ class ClaudeProvider(AnswerProvider):
         answer = str(envelope.get("answer", "")).strip()
 
         return ExplainResult(answer=answer, trace_fragment=trace_fragment)
+
+    def general_knowledge(
+        self,
+        question_scrubbed: str,
+        excerpts: list[dict],
+        api_key: str,
+        config: ProviderConfig,
+    ) -> GeneralKnowledgeResult:
+        """Explain a concept, drawing ONLY from `excerpts` when given, else the
+        model's own general knowledge (Sprint 13, plan.md §B.6.5). Defence in
+        depth (§B.6.2): re-checks the pattern-level PII part hr-backend's
+        `PiiScrubber` already applied and REFUSES the call outright if any
+        pattern is still present — this method must never forward a
+        PII-bearing question to the provider, even on a scrubber miss."""
+        import anthropic
+
+        from app.general_lane import refuse_if_pii
+
+        refuse_if_pii(question_scrubbed)
+
+        client = anthropic.Anthropic(api_key=api_key, base_url=config.endpoint or None)
+        if excerpts:
+            excerpt_text = "\n\n".join(
+                f"[{e.get('id')}] {e.get('title', '')}\n{e.get('text', '')}" for e in excerpts
+            )
+            user_prompt = (
+                f"PREGUNTA (sin datos personales): {question_scrubbed}\n\n"
+                f"EXTRACTOS DISPONIBLES:\n{excerpt_text}"
+            )
+        else:
+            user_prompt = f"PREGUNTA (sin datos personales): {question_scrubbed}\n\nNo hay extractos disponibles."
+
+        started = time.monotonic()
+        resp = client.messages.create(
+            model=config.model,
+            # 512 truncated a ~200-word Spanish answer + JSON envelope mid-string on
+            # conceptual questions (stop_reason=max_tokens → parse_error →
+            # "unavailable"); found by the step-11 lane-forced harness.
+            max_tokens=1024,
+            system=GENERAL_KNOWLEDGE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+
+        raw_text = "".join(
+            block.text for block in resp.content if getattr(block, "type", None) == "text"
+        )
+
+        in_tok = getattr(resp.usage, "input_tokens", None) or 0
+        out_tok = getattr(resp.usage, "output_tokens", None) or 0
+        price_in, price_out = OCR_PRICING_PER_MTOK.get(config.model, _OCR_DEFAULT_PRICING)
+        cost_usd = round((in_tok / 1_000_000) * price_in + (out_tok / 1_000_000) * price_out, 6)
+        trace_fragment = {
+            "provider": config.provider,
+            "model": config.model,
+            "general_knowledge_ms": elapsed_ms,
+            "prompt_tokens": in_tok,
+            "completion_tokens": out_tok,
+            "cost_usd": cost_usd,
+        }
+
+        try:
+            envelope = _extract_json(raw_text)
+        except (json.JSONDecodeError, ValueError):
+            # Unparseable output → no answer. hr-backend's tool treats an
+            # empty answer as NO_MATERIAL — never guesses, never surfaces a
+            # half-formed response.
+            return GeneralKnowledgeResult(answer="", sources=[], trace_fragment={
+                **trace_fragment,
+                "parse_error": True,
+                "stop_reason": getattr(resp, "stop_reason", None),
+            })
+
+        answer = str(envelope.get("answer", "")).strip()
+        used_ids = envelope.get("sources_used", [])
+        used_ids = {str(i) for i in used_ids} if isinstance(used_ids, list) else set()
+
+        if excerpts:
+            by_id = {str(e.get("id")): e for e in excerpts}
+            sources = [
+                # `excerpt` carries the fetched page text back to hr-backend —
+                # its OWN grounding call (`/ground`, source_type='general_web')
+                # needs the real cited text, not just a title, to entail the
+                # answer against (§B.6.4). Never sent to the employee (badge/
+                # `decorate()` only surfaces `title`/`url`); server-side only.
+                {"kind": "web", "id": eid, "title": by_id[eid].get("title", ""), "excerpt": by_id[eid].get("text", "")}
+                for eid in used_ids
+                if eid in by_id
+            ]
+            # The model claimed to use excerpts but named none we recognise —
+            # treat as unsourced rather than silently promoting to model_
+            # knowledge (a web-catalogue call that produced nothing usable).
+            if not sources:
+                answer = ""
+        else:
+            sources = [{"kind": "model_knowledge", "title": "conocimiento general"}] if answer else []
+
+        return GeneralKnowledgeResult(answer=answer, sources=sources, trace_fragment=trace_fragment)
 
     def classify(
         self,
