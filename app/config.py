@@ -114,6 +114,15 @@ class Settings(BaseSettings):
     router_model: str = "claude-haiku-4-5"
     router_endpoint: str = ""  # empty → falls back to answer_endpoint
 
+    # --- Planner (Sprint 13, plan.md §C.7) ---
+    # Its OWN knob, never aliased to answer_model: a future chat-quality swap
+    # must not silently change routing. Same EU-endpoint constraint; the
+    # endpoint defaults to answer_endpoint unless overridden. Display value
+    # for /health/config — the real per-call model arrives as
+    # provider_config.model from hr-backend.
+    planner_model: str = "claude-sonnet-5"
+    planner_endpoint: str = ""  # empty → falls back to answer_endpoint
+
     # --- OCR fallback (Sprint 7e, ADR-0026) ---
     # Deliberately its OWN config value, never aliased to answer_model: the
     # engine eval (sprint-07e/eval/, review.md §1) scored THREE Claude models
