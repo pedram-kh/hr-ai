@@ -129,6 +129,37 @@ TOOLS: list[dict] = [
             "additionalProperties": False,
         },
     },
+    # Sprint 13b (plan.md §2): a CONTROL tool, like escalate/finalize — sent only when the caller lists it in
+    # `enabled_tools` (hr-backend offers it on the first planner round only). Listed LAST so adding it does not
+    # reorder the tools above (a tool-order change is a prompt_version change and a routing-drift risk).
+    {
+        "name": "normalize_question",
+        "description": (
+            "Declara cómo entiendes la pregunta, SOLO para las herramientas. La persona "
+            "nunca lo ve y no cambia lo que se le responde ni qué reglas se aplican. Llámala UNA vez, en la primera "
+            "ronda, junto a tu primera herramienta. Si la pregunta trata varios temas, o es un caso personal más "
+            "que una consulta de dato, pon topic_id y canonical_query a null. "
+            "topic_id: el id del tema de \"approved_topics\" (en Alcance) que corresponde claramente, o null. "
+            "canonical_query: la MISMA pregunta como sintagma nominal en vocabulario de convenio o de ley "
+            "(máx. 25 palabras), o null. Solo reformula lo que la persona ya dijo. NO añadas cifras, importes, "
+            "fechas ni años. NO uses: \"derecho a\", \"corresponde\", \"mínimo\", \"máximo\", \"plazo de\", \"al año\", \"cada\". "
+            "NO uses palabras de pago que la persona no haya dicho: retribución, remuneración, salario, sueldo, "
+            "plus, complemento, cobrar, pagar (\"permiso retribuido\" como nombre del tema sí vale). "
+            "NO nombres grupos, niveles, categorías, convenios, provincias ni territorios. "
+            "confidence: entre 0 y 1. reason: una línea (la verá RR. HH., no la persona)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic_id": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                "canonical_query": {"anyOf": [{"type": "string", "maxLength": 220}, {"type": "null"}]},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "reason": {"type": "string", "maxLength": 160},
+            },
+            "required": ["topic_id", "canonical_query", "confidence", "reason"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 TOOLS_BY_NAME: dict[str, dict] = {t["name"]: t for t in TOOLS}
@@ -145,4 +176,11 @@ Las reglas del sistema pueden anular una herramienta que hayas pedido (sustituir
 denegarla o terminar el turno). Eso es esperado; no insistas en la misma llamada.
 Si dudas, usa escalate.
 Nunca pidas al empleado su grupo profesional, convenio, provincia, antigüedad,
-tipo de contrato ni lo que cobra."""
+tipo de contrato ni lo que cobra.
+Además de elegir herramientas, en la primera ronda entiende la pregunta: la persona puede hablar en
+coloquial. Tradúcela a un tema aprobado y a una reformulación con el vocabulario del convenio. Es solo
+para buscar: nunca añadas algo que la persona no haya dicho, y si dudas del tema, topic_id null.
+Ejemplos (no exhaustivos):
+«Quiero pedirme un año sin trabajar pero conservando mi puesto» → tema «excedencias»; canonical
+«excedencia voluntaria: reserva del puesto de trabajo».
+«¿Puedo llevar a mi perro a la oficina?» → topic_id null, canonical_query null (fuera del vocabulario)."""
