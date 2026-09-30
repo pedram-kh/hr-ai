@@ -1487,23 +1487,32 @@ class ClaudeProvider(AnswerProvider):
             if not (1 <= i <= len(chunks)):
                 continue
             c = chunks[i - 1]
-            src_key = c.chunk_id if c.chunk_id is not None else (getattr(c, "source_type", "chunk"), c.document_id)
+            fact_id = getattr(c, "fact_id", None)
+            if c.chunk_id is not None:
+                src_key = c.chunk_id
+            elif fact_id is not None:
+                # Slice 13d: two facts from ONE document stay two sources (keyed by fact).
+                src_key = (getattr(c, "source_type", "chunk"), c.document_id, fact_id)
+            else:
+                src_key = (getattr(c, "source_type", "chunk"), c.document_id)
             if src_key in srckey_to_display:
                 # A second model-index pointing at an already-cited source: reuse
                 # its display number so the marker still resolves 1:1.
                 orig_to_display[i] = srckey_to_display[src_key]
                 continue
             display = len(citations) + 1
-            citations.append(
-                {
-                    "chunk_id": c.chunk_id,
-                    "source_type": getattr(c, "source_type", "chunk"),
-                    "document_id": c.document_id,
-                    "page_from": c.page_from,
-                    "page_to": c.page_to,
-                    "authority_level": c.authority_level,
-                }
-            )
+            citation = {
+                "chunk_id": c.chunk_id,
+                "source_type": getattr(c, "source_type", "chunk"),
+                "document_id": c.document_id,
+                "page_from": c.page_from,
+                "page_to": c.page_to,
+                "authority_level": c.authority_level,
+            }
+            if fact_id is not None:
+                # Only present for a fact-SET source; absent => byte-identical to before 13d.
+                citation["fact_id"] = fact_id
+            citations.append(citation)
             orig_to_display[i] = display
             srckey_to_display[src_key] = display
             if c.authority_level:
