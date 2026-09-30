@@ -182,6 +182,12 @@ class SynthesisChunk(BaseModel):
     # and every field defaults exactly as before (byte-for-byte identical request).
     chunk_id: int | None = None
     source_type: str = "chunk"  # 'chunk' | 'reference_fact'
+    # Slice 13d (ADR-0037): OPTIONAL identity of a structured fact. Several verified facts can
+    # come from ONE document (convenio 20 facts 140 + 143 are both document 50), and a
+    # null-chunk source is otherwise keyed by (source_type, document_id) — so the second fact's
+    # citation would collapse onto the first. Absent (every prose turn, every single-fact
+    # composition) => the key, and the output, are exactly what they were.
+    fact_id: int | None = None
     document_id: int
     page_from: int | None = None
     page_to: int | None = None
@@ -781,6 +787,7 @@ def synthesise(req: SynthesiseRequest) -> JSONResponse:
             ChunkInput(
                 chunk_id=c.chunk_id,
                 source_type=c.source_type,
+                fact_id=c.fact_id,
                 document_id=c.document_id,
                 page_from=c.page_from,
                 page_to=c.page_to,

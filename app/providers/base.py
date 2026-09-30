@@ -37,6 +37,8 @@ class ChunkInput:
     score: float
     authority_level: str | None
     source_type: str = "chunk"  # 'chunk' | 'reference_fact'
+    # Slice 13d (ADR-0037): which fact, when several facts share one document. None = unchanged.
+    fact_id: int | None = None
 
 
 @dataclass
