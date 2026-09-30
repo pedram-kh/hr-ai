@@ -8,6 +8,8 @@ script mocks the Anthropic client and asserts:
   3. The Anthropic call never sends a `temperature` parameter (§C.10).
   4. `tool_choice` is `any` and thinking is disabled.
   5. `prompt_version` is a stable sha256 of system + the enabled tools.
+  6. (Sprint 13b) `normalize_question` rides the same call, the envelope is unchanged,
+     and it is only sent / only forwarded when enabled.
 
 Run:
     python3 scripts/planner_contract_test.py
@@ -121,6 +123,47 @@ def main() -> int:
     if prompt_version(TOOLS) == v1:
         failures.append("(5) FAILED: full TOOLS hash collided with a 2-tool subset")
     print("(5) prompt_version stable + order-independent:", "FAIL" if any("(5)" in f for f in failures) else "OK")
+
+    # --- (6) Sprint 13b: normalize_question is a control tool on the SAME call, no envelope change ---
+    norm_input = {"topic_id": 12, "canonical_query": "permiso retribuido por matrimonio", "confidence": 0.82, "reason": "boda"}
+    client6 = _CapturingClient(
+        [
+            _FakeToolUse("reference_fact", "tu_1", {}),
+            _FakeToolUse("normalize_question", "tu_2", norm_input),
+        ]
+    )
+    r6 = plan(
+        question="me caso, ¿me dan días?",
+        scope_summary={"approved_topics": [{"id": 12, "name": "permisos retribuidos", "has_verified_fact": True}]},
+        window={"exchanges": [], "message_ids": []},
+        enabled_tools=["reference_fact", "escalate", "finalize", "normalize_question"],
+        prior_steps=[],
+        api_key="test-key",
+        provider_config={"provider": "claude", "model": "claude-sonnet-5", "endpoint": None},
+        client=client6,
+    )
+    if [c["tool"] for c in r6["calls"]] != ["reference_fact", "normalize_question"]:
+        failures.append(f"(6) FAILED: normalize_question call not returned alongside the tool call: {r6['calls']}")
+    if r6["calls"][-1]["input"] != norm_input:
+        failures.append("(6) FAILED: normalize_question input was altered in transit (hr-ai must not interpret it)")
+    if sorted(r6.keys()) != sorted(result.keys()):
+        failures.append(f"(6) FAILED: /plan envelope keys changed: {sorted(r6.keys())} vs {sorted(result.keys())}")
+    sent6 = [t["name"] for t in (client6.last_kwargs or {}).get("tools", [])]
+    if sent6 != ["reference_fact", "escalate", "finalize", "normalize_question"]:
+        failures.append(f"(6) FAILED: normalize_question not sent in spec order (last): {sent6}")
+    # not enabled -> never sent, and a model-invented call is dropped
+    client6b = _CapturingClient([_FakeToolUse("normalize_question", "tu_3", norm_input), _FakeToolUse("finalize", "tu_4", {})])
+    r6b = plan("q", {}, {}, ["finalize"], [], "k", {"provider": "claude", "model": "m", "endpoint": None}, client=client6b)
+    if "normalize_question" in [t["name"] for t in (client6b.last_kwargs or {}).get("tools", [])] or [c["tool"] for c in r6b["calls"]] != ["finalize"]:
+        failures.append("(6) FAILED: normalize_question leaked when it was not enabled")
+    # the other tools' hash inputs are untouched: the tool's own schema is the only thing that differs
+    base = [t for t in TOOLS if t["name"] != "normalize_question"]
+    if [t["name"] for t in TOOLS][:len(base)] != [t["name"] for t in base]:
+        failures.append("(6) FAILED: normalize_question reordered the existing tools")
+    nq = next(t for t in TOOLS if t["name"] == "normalize_question")
+    if nq["input_schema"]["required"] != ["topic_id", "canonical_query", "confidence", "reason"] or nq["input_schema"].get("additionalProperties") is not False:
+        failures.append("(6) FAILED: normalize_question schema drifted from plan.md §2.2")
+    print("(6) normalize_question: same call, envelope unchanged, gated by enabled_tools:", "FAIL" if any("(6)" in f for f in failures) else "OK")
 
     if failures:
         for f in failures:
