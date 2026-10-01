@@ -388,6 +388,74 @@ def provider_checks() -> None:
         res = ClaudeProvider().general_knowledge("¿Qué es un ERTE?", [], "sk-test", cfg)
         check("(14) no excerpts -> model_knowledge source", res.sources == [{"kind": "model_knowledge", "title": "conocimiento general"}], repr(res.sources))
 
+        # ---- Slice 13c: the model-knowledge prompt ---------------------------------------------------------------
+        import hashlib
+
+        from app.providers.claude import GENERAL_KNOWLEDGE_MODEL_SYSTEM_PROMPT, GENERAL_KNOWLEDGE_SYSTEM_PROMPT
+
+        sha = lambda t: hashlib.sha256(t.encode("utf-8")).hexdigest()  # noqa: E731
+        reply = '{"answer": "Es una situación en la que se suspende el contrato. Consulta tu convenio.", "sources_used": []}'
+
+        sys.modules["anthropic"] = fake_module(reply)
+        res = ClaudeProvider().general_knowledge("¿Qué es una excedencia?", [], "sk-test", cfg)
+        check("(15) default call (no flag) uses the Sprint-13 web prompt, unchanged", seen["kwargs"]["system"] == GENERAL_KNOWLEDGE_SYSTEM_PROMPT, "")
+        check("(15) ... and records its sha256 + basis", res.trace_fragment.get("prompt_sha256") == sha(GENERAL_KNOWLEDGE_SYSTEM_PROMPT) and res.trace_fragment.get("basis") == "model_knowledge", repr(res.trace_fragment))
+
+        res = ClaudeProvider().general_knowledge("¿Qué es una excedencia?", [], "sk-test", cfg, model_knowledge=True)
+        check("(15) model_knowledge=True and no excerpts -> the dedicated prompt", seen["kwargs"]["system"] == GENERAL_KNOWLEDGE_MODEL_SYSTEM_PROMPT, "")
+        check("(15) ... with its own sha256 and basis=model_knowledge in the trace", res.trace_fragment.get("prompt_sha256") == sha(GENERAL_KNOWLEDGE_MODEL_SYSTEM_PROMPT) and res.trace_fragment.get("basis") == "model_knowledge", repr(res.trace_fragment))
+        check("(15) ... the source is still model_knowledge, the reply format unchanged", res.sources == [{"kind": "model_knowledge", "title": "conocimiento general"}] and res.answer.startswith("Es una situación"), repr(res))
+        check("(15) the two prompts differ and the model one forbids citations, figures and entitlement language and demands the pointer",
+              GENERAL_KNOWLEDGE_MODEL_SYSTEM_PROMPT != GENERAL_KNOWLEDGE_SYSTEM_PROMPT
+              and all(t in GENERAL_KNOWLEDGE_MODEL_SYSTEM_PROMPT for t in ("PROHIBIDO", "Citas:", "tienes derecho", "NUNCA más de 120", "convenio colectivo o a Recursos Humanos", '"sources_used": []')), "")
+        check("(15) no temperature param on the new call either", "temperature" not in seen["kwargs"], "")
+
+        sys.modules["anthropic"] = fake_module('{"answer": "Es un tramo inicial del contrato.", "sources_used": ["sepe-x"]}')
+        res = ClaudeProvider().general_knowledge("¿Qué es el periodo de prueba?", excerpts, "sk-test", cfg, model_knowledge=True)
+        check("(15) model_knowledge=True WITH excerpts still uses the web prompt (never changes a grounded call)", seen["kwargs"]["system"] == GENERAL_KNOWLEDGE_SYSTEM_PROMPT and res.trace_fragment.get("basis") == "web", repr(res.trace_fragment))
+
+        # ---- Slice 13c: the FROZEN model-knowledge prompt (S2 redesign, 2026-09-30; S1b's 131f6a8f… superseded). Any edit changes this hash and must be a
+        # deliberate, re-measured decision (plan.md §2.3 / hr-docs results/s1b-report.md), not a drive-by.
+        check("(17) model-knowledge prompt hash is the frozen one",
+              sha(GENERAL_KNOWLEDGE_MODEL_SYSTEM_PROMPT) == "68893dbacd049b6a687e361ffe2595f1156045be63573bb591595bb7d57a59af", sha(GENERAL_KNOWLEDGE_MODEL_SYSTEM_PROMPT))
+        check("(17) the frozen prompt defines only: it forbids affirming or denying that a right, permit, payment or obligation exists",
+              all(t in GENERAL_KNOWLEDGE_MODEL_SYSTEM_PROMPT for t in ("Afirmar o negar que exista o se aplique un derecho, permiso, pago u obligación", "no existe un permiso", "suele implicar la pérdida de", "es un derecho", "Solo DEFINES el concepto")), "")
+        check("(17) the web prompt is untouched by the 13c iteration",
+              sha(GENERAL_KNOWLEDGE_SYSTEM_PROMPT) == "e9e2c6a18f1cb059d71143b66d2dd5faf4620bba72dcb0d0fba5122c0f4b1365", sha(GENERAL_KNOWLEDGE_SYSTEM_PROMPT))
+
+        # ---- Slice 13c: `skip_web` — the model-knowledge fallback never touches the catalogue ---------------------
+        import app.general_lane as gl
+        import app.providers as providers_pkg
+        from app.main import GeneralKnowledgeRequest, general_knowledge as gk_endpoint
+
+        fetched: list[str] = []
+        real_fetch = gl.fetch_source
+        real_get = providers_pkg.get_provider
+
+        class _Stub:
+            def __init__(self):
+                self.kwargs = None
+
+            def general_knowledge(self, q, excerpts, key, config, model_knowledge=False):
+                self.kwargs = {"excerpts": excerpts, "model_knowledge": model_knowledge}
+                return GeneralKnowledgeResult(answer="Es algo.", sources=[], trace_fragment={"basis": "model_knowledge"})
+
+        stub = _Stub()
+        gl.fetch_source = lambda url, *a, **k: fetched.append(url) or (_ for _ in ()).throw(AssertionError("fetch must not run"))
+        providers_pkg.get_provider = lambda name: stub
+        try:
+            body = dict(question_scrubbed="¿Qué es una excedencia?", allowed_domains=["boe.es"],
+                        catalogue=[{"id": "x", "url": "https://www.boe.es/x", "title": "X", "topics": ["excedencia"]}],
+                        provider_api_key="sk", provider_config={"provider": "claude", "model": "m"}, model_knowledge=True)
+            out = gk_endpoint(GeneralKnowledgeRequest(**body, skip_web=True))
+            check("(16) skip_web: no catalogue fetch is attempted", fetched == [], repr(fetched))
+            check("(16) skip_web: the provider gets no excerpts and model_knowledge=True", stub.kwargs == {"excerpts": [], "model_knowledge": True}, repr(stub.kwargs))
+            check("(16) skip_web: the response carries no fetches", b'"fetches":[]' in out.body.replace(b" ", b""), out.body.decode())
+            check("(16) skip_web defaults to False", GeneralKnowledgeRequest(**body).skip_web is False, "")
+        finally:
+            gl.fetch_source = real_fetch
+            providers_pkg.get_provider = real_get
+
         sys.modules["anthropic"] = fake_module("not json at all")
         res = ClaudeProvider().general_knowledge("¿Qué es un ERTE?", [], "sk-test", cfg)
         check("(14) unparseable output -> empty answer, parse_error traced", res.answer == "" and res.trace_fragment.get("parse_error") is True, repr(res))

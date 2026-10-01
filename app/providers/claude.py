@@ -16,6 +16,7 @@ Two safety properties live here:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -127,6 +128,35 @@ SYSTEM_PROMPT = (
     'vacío si te abstienes>], '
     '"confidence": <número entre 0 y 1>}'
 )
+
+
+# Slice 13c (abstention flag). APPENDED to SYSTEM_PROMPT only when the caller sends `report_abstention` (hr-backend does so
+# only with the model-knowledge sub-flag on); with it off the system prompt, the request and the response are byte-identical
+# to before. A prose abstention that still cites a related source ("No dispongo de información suficiente… [Fuente 1]")
+# slips past rule 6's `cited_sources: []` contract, so the model declares it explicitly.
+SYNTHESIS_ABSTENTION_ADDENDUM = (
+    "\n\nCAMPO ADICIONAL `abstained` (obligatorio en esta llamada): añade al objeto JSON `\"abstained\": true|false`. "
+    "Pon `true` cuando las fuentes NO responden a la pregunta formulada — también si citas una fuente para un dato "
+    "relacionado pero distinto, o si tu respuesta dice que no dispones de información suficiente o que ninguna fuente "
+    "define o menciona lo preguntado. Pon `false` cuando tu respuesta contesta la pregunta con lo que enuncian las "
+    "fuentes."
+)
+
+# FALLBACK only (used when the model returned no `abstained` field): an answer whose OPENING sentence is an abstention.
+# Anchored at the start on purpose: "…no contienen una definición…" at the END of an otherwise substantive answer is a
+# partial answer, not an abstention.
+SYNTHESIS_ABSTENTION_OPENERS = re.compile(
+    r"^\s*(?:"
+    r"no\s+dispongo\s+de\s+informaci[oó]n\s+suficiente"
+    r"|ninguna\s+de\s+las\s+fuentes(?:\s+\w+){0,2}\s+(?:menciona|contiene|recoge|define|habla|aborda|responde)"
+    r"|las\s+fuentes(?:\s+\w+){0,2}\s+no\s+(?:contienen|mencionan|recogen|definen|abordan|responden)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def detect_abstention_phrase(answer: str) -> bool:
+    return bool(answer) and SYNTHESIS_ABSTENTION_OPENERS.search(answer) is not None
 
 
 def _authority_label(level: str | None) -> str:
@@ -1357,6 +1387,42 @@ GENERAL_KNOWLEDGE_SYSTEM_PROMPT = (
 )
 
 
+# Slice 13c (plan.md §2.3) — the prompt for a model-knowledge draft (NO fetched page). Selected only when hr-backend asks for it
+# (`model_knowledge=True`, i.e. the sub-flag is effectively on) AND there are no excerpts; the web-grounded prompt above is
+# untouched. The prompt is the first line of defence only: hr-backend's post-check and ModelKnowledgeShapeCheck re-verify
+# deterministically. Its sha256 is recorded in the trace, so an edit here is visible in every later audit.
+GENERAL_KNOWLEDGE_MODEL_SYSTEM_PROMPT = (
+    "Eres el asistente de RR. HH. de una empresa en España. Te hacen una pregunta de "
+    "comprensión general (qué es algo, cómo funciona, en qué se diferencia de otra cosa). "
+    "No tienes ningún documento: respondes con conocimiento general.\n\n"
+    "Escribe una explicación en español claro y neutro de unas 90 palabras (entre 70 y 100; "
+    "NUNCA más de 120), en UN solo párrafo. Sé breve: una definición y para qué sirve, sin "
+    "enumerar supuestos, casos ni ejemplos. Describe QUÉ ES y PARA QUÉ SIRVE (\"es\", "
+    "\"consiste en\", \"suele\", \"sirve para\").\n\n"
+    "PROHIBIDO. Si el concepto parece pedirlo, omítelo y di que lo fijan la ley o el convenio:\n"
+    "- Cifras de cualquier tipo: números, plazos, duraciones, edades, porcentajes, importes y "
+    "cantidades escritas con letra (\"dos semanas\", \"un mes\", \"medio día\").\n"
+    "- Lenguaje de derecho o de cobro aplicado a quien pregunta: \"tienes derecho\", "
+    "\"te corresponde\", \"te pagan\", \"puedes exigir\", \"estás obligado\", "
+    "\"garantiza\", \"siempre\".\n"
+    "- Citas: no cites leyes, artículos, reales decretos, sentencias, organismos como fuente ni "
+    "enlaces, y no escribas \"[Fuente]\". No digas \"según la ley X\".\n"
+    "- Hablar de la situación concreta de quien pregunta.\n"
+    "- Afirmar o negar que exista o se aplique un derecho, permiso, pago u obligación, ni en general "
+    "ni para quien pregunta: nada de \"es un derecho\", \"tiene derecho\", \"están obligados a\", "
+    "\"no existe un permiso\", \"suele implicar la pérdida de…\", \"se mantiene el salario\". "
+    "Solo DEFINES el concepto y para qué sirve; si la pregunta es si existe o se cobra algo, "
+    "explica qué es y remite al convenio o a la ley sin responder sí ni no.\n\n"
+    "Termina SIEMPRE con una frase que remita a su convenio colectivo o a Recursos Humanos "
+    "para saber cómo se aplica a su caso.\n\n"
+    "Responde SOLO con JSON: {\"answer\": \"...\", \"sources_used\": []}"
+)
+
+
+def _prompt_sha256(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+
 class ClaudeProvider(AnswerProvider):
     def synthesise(
         self,
@@ -1364,11 +1430,13 @@ class ClaudeProvider(AnswerProvider):
         chunks: list[ChunkInput],
         api_key: str,
         config: ProviderConfig,
+        report_abstention: bool = False,
     ) -> SynthesisResult:
         import anthropic  # imported lazily so the dep is only needed at call time
 
         client = anthropic.Anthropic(api_key=api_key, base_url=config.endpoint or None)
         user_prompt = _build_user_prompt(question, chunks)
+        system_prompt = SYSTEM_PROMPT + SYNTHESIS_ABSTENTION_ADDENDUM if report_abstention else SYSTEM_PROMPT
 
         # Sprint 10-M: 1024 -> 4096 (matches /ground's first-tier budget). Named,
         # narrow exception to the model-swap-only fence, authorized for the
@@ -1387,7 +1455,7 @@ class ClaudeProvider(AnswerProvider):
         resp = client.messages.create(
             model=config.model,
             max_tokens=SYNTHESISE_MAX_TOKENS,
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
         budget = SYNTHESISE_MAX_TOKENS
@@ -1398,7 +1466,7 @@ class ClaudeProvider(AnswerProvider):
             resp = client.messages.create(
                 model=config.model,
                 max_tokens=SYNTHESISE_MAX_TOKENS_RETRY,
-                system=SYSTEM_PROMPT,
+                system=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}],
             )
         elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -1539,6 +1607,30 @@ class ClaudeProvider(AnswerProvider):
         # stable, readable audit value.
         authority_ordered = sorted(authority_used, key=lambda a: _AUTHORITY_RANK.get(a, 99))
 
+        trace_fragment = {
+            "provider": config.provider,
+            "model": config.model,
+            "prompt_tokens": in_tok,
+            "completion_tokens": out_tok,
+            "cost_usd": cost_usd,
+            "synthesis_ms": elapsed_ms,
+            "authority_used": authority_ordered,
+        }
+        abstained: bool | None = None
+        abstained_by: str | None = None
+        if report_abstention:
+            flag = envelope.get("abstained")
+            phrase = detect_abstention_phrase(answer)
+            if isinstance(flag, bool):
+                # the model's own structured declaration wins; a disagreeing phrase is recorded, never acted on
+                abstained, abstained_by = flag, "model_flag"
+                if phrase and not flag:
+                    trace_fragment["abstention_phrase_disagrees"] = True
+            else:
+                # no usable flag from the model -> the phrase match, as a FALLBACK only
+                abstained, abstained_by = (True, "phrase") if phrase else (False, None)
+            trace_fragment["abstention_flag_present"] = isinstance(flag, bool)
+
         return SynthesisResult(
             answer=answer,
             citations=citations,
@@ -1549,15 +1641,9 @@ class ClaudeProvider(AnswerProvider):
             },
             confidence=confidence,
             authority_used=authority_ordered,
-            trace_fragment={
-                "provider": config.provider,
-                "model": config.model,
-                "prompt_tokens": in_tok,
-                "completion_tokens": out_tok,
-                "cost_usd": cost_usd,
-                "synthesis_ms": elapsed_ms,
-                "authority_used": authority_ordered,
-            },
+            trace_fragment=trace_fragment,
+            abstained=abstained,
+            abstained_by=abstained_by,
         )
 
     def explain(
@@ -1627,6 +1713,7 @@ class ClaudeProvider(AnswerProvider):
         excerpts: list[dict],
         api_key: str,
         config: ProviderConfig,
+        model_knowledge: bool = False,
     ) -> GeneralKnowledgeResult:
         """Explain a concept, drawing ONLY from `excerpts` when given, else the
         model's own general knowledge (Sprint 13, plan.md §B.6.5). Defence in
@@ -1652,6 +1739,10 @@ class ClaudeProvider(AnswerProvider):
         else:
             user_prompt = f"PREGUNTA (sin datos personales): {question_scrubbed}\n\nNo hay extractos disponibles."
 
+        # Slice 13c: the model-knowledge prompt only when asked for AND nothing was fetched; everything else is the Sprint-13 call.
+        use_model_prompt = bool(model_knowledge) and not excerpts
+        system_prompt = GENERAL_KNOWLEDGE_MODEL_SYSTEM_PROMPT if use_model_prompt else GENERAL_KNOWLEDGE_SYSTEM_PROMPT
+
         started = time.monotonic()
         resp = client.messages.create(
             model=config.model,
@@ -1659,7 +1750,7 @@ class ClaudeProvider(AnswerProvider):
             # conceptual questions (stop_reason=max_tokens → parse_error →
             # "unavailable"); found by the step-11 lane-forced harness.
             max_tokens=1024,
-            system=GENERAL_KNOWLEDGE_SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
         elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -1679,6 +1770,8 @@ class ClaudeProvider(AnswerProvider):
             "prompt_tokens": in_tok,
             "completion_tokens": out_tok,
             "cost_usd": cost_usd,
+            "basis": "model_knowledge" if not excerpts else "web",
+            "prompt_sha256": _prompt_sha256(system_prompt),
         }
 
         try:
