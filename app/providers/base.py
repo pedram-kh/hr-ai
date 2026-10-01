@@ -66,6 +66,11 @@ class SynthesisResult:
     confidence: float = 0.0
     authority_used: list[str] = field(default_factory=list)
     trace_fragment: dict = field(default_factory=dict)
+    # Slice 13c: only set when the caller asked for it (`report_abstention=True`). True = the sources do NOT answer the
+    # question (even when a related source was cited). `abstained_by` = "model_flag" (the model's own JSON field, the
+    # structured signal) | "phrase" (fallback, used only when the model gave no flag). None/None = not asked.
+    abstained: bool | None = None
+    abstained_by: str | None = None
 
 
 @dataclass
@@ -345,10 +350,13 @@ class AnswerProvider(ABC):
         chunks: list[ChunkInput],
         api_key: str,
         config: ProviderConfig,
+        report_abstention: bool = False,
     ) -> SynthesisResult:
         """Compose a cited answer grounded ONLY in `chunks`, honouring the
         convenio-over-baseline precedence rule. `api_key` is used for this one
-        call and never persisted."""
+        call and never persisted. `report_abstention` (Slice 13c, default off =
+        byte-identical call) asks the model to declare whether the sources answer
+        the question and fills `SynthesisResult.abstained`."""
         raise NotImplementedError
 
     @abstractmethod
@@ -380,6 +388,7 @@ class AnswerProvider(ABC):
         excerpts: list[dict],
         api_key: str,
         config: ProviderConfig,
+        model_knowledge: bool = False,
     ) -> GeneralKnowledgeResult:
         """Explain a labour-law CONCEPT in general terms — never a figure, a
         duration, or a concrete entitlement of the caller's own (Sprint 13,
@@ -394,7 +403,10 @@ class AnswerProvider(ABC):
         `excerpts` is empty the answer comes from the model's own training
         knowledge (`sources=[{kind:'model_knowledge', title}]` in the
         result); when non-empty, the answer must draw ONLY from them
-        (`sources=[{kind:'web', id, title}]`, one per excerpt actually used)."""
+        (`sources=[{kind:'web', id, title}]`, one per excerpt actually used).
+
+        `model_knowledge` (Slice 13c, default False = the Sprint-13 call) selects the dedicated model-knowledge prompt
+        when `excerpts` is empty; it never changes a call that has excerpts."""
         raise NotImplementedError
 
     @abstractmethod

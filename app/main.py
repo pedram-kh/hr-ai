@@ -224,6 +224,8 @@ class SynthesiseRequest(BaseModel):
     # (never a header) per call. Used for this one request only; never persisted.
     provider_api_key: str
     provider_config: ProviderConfigBody
+    # Slice 13c: ask the model to declare whether the sources answer the question (default off = unchanged call/response).
+    report_abstention: bool = False
 
 
 class ExplainRequest(BaseModel):
@@ -264,6 +266,11 @@ class GeneralKnowledgeRequest(BaseModel):
     question_scrubbed: str
     allowed_domains: list[str] = []
     catalogue: list[GeneralLaneSourceBody] = []
+    # Slice 13c: hr-backend sets it only when the model-knowledge sub-flag is effectively on; absent/False = the Sprint-13 call.
+    model_knowledge: bool = False
+    # Slice 13c fallback: hr-backend sets it (only true) to ask for the model-knowledge draft WITHOUT a catalogue fetch, after a web
+    # attempt produced nothing usable. Absent/False = the call as before.
+    skip_web: bool = False
     provider_api_key: str
     provider_config: ProviderConfigBody
 
@@ -802,17 +809,22 @@ def synthesise(req: SynthesiseRequest) -> JSONResponse:
             model=req.provider_config.model,
             endpoint=req.provider_config.endpoint,
         )
-        result = provider.synthesise(req.question, chunks, req.provider_api_key, config)
-        return JSONResponse(
-            {
-                "answer": result.answer,
-                "citations": result.citations,
-                "grounding_signal": result.grounding_signal,
-                "confidence": result.confidence,
-                "authority_used": result.authority_used,
-                "trace_fragment": result.trace_fragment,
-            }
-        )
+        if req.report_abstention:
+            result = provider.synthesise(req.question, chunks, req.provider_api_key, config, report_abstention=True)
+        else:
+            result = provider.synthesise(req.question, chunks, req.provider_api_key, config)
+        body = {
+            "answer": result.answer,
+            "citations": result.citations,
+            "grounding_signal": result.grounding_signal,
+            "confidence": result.confidence,
+            "authority_used": result.authority_used,
+            "trace_fragment": result.trace_fragment,
+        }
+        if req.report_abstention:
+            body["abstained"] = bool(result.abstained)
+            body["abstained_by"] = result.abstained_by
+        return JSONResponse(body)
     except Exception as exc:  # noqa: BLE001 - provider/parse failure → escalation
         # NEVER include the request body (it carries the key). Only the message.
         return JSONResponse({"error": "provider_error", "detail": str(exc)}, status_code=200)
@@ -878,7 +890,7 @@ def general_knowledge(req: GeneralKnowledgeRequest) -> JSONResponse:
 
     try:
         catalogue = [s.model_dump() for s in req.catalogue]
-        candidates = select_sources(req.question_scrubbed, catalogue)
+        candidates = [] if req.skip_web else select_sources(req.question_scrubbed, catalogue)
 
         fetches: list[dict] = []
         excerpts: list[dict] = []
@@ -910,7 +922,7 @@ def general_knowledge(req: GeneralKnowledgeRequest) -> JSONResponse:
             endpoint=req.provider_config.endpoint,
         )
         result: GeneralKnowledgeResult = provider.general_knowledge(
-            req.question_scrubbed, excerpts, req.provider_api_key, config,
+            req.question_scrubbed, excerpts, req.provider_api_key, config, model_knowledge=req.model_knowledge,
         )
         return JSONResponse({
             "answer": result.answer,

@@ -70,9 +70,11 @@ TOOLS: list[dict] = [
             "NO DISPONIBLE al empezar el turno: nunca la propongas como primera herramienta, "
             "aunque la pregunta sea conceptual (qué es una excedencia, qué significa IT). Empieza "
             "siempre por convenio_search (o reference_fact / salary_lookup si corresponde). Solo "
-            "puedes usarla después de que convenio_search no encuentre material "
-            "o su respuesta no llegue a sustentarse (status check_a_failed / entailment_failed). "
-            "Nunca para cantidades, plazos, porcentajes ni derechos concretos de la persona: esas "
+            "puedes usarla después de que convenio_search no encuentre material, "
+            "su respuesta no llegue a sustentarse o no pueda responder "
+            "(status check_a_failed / entailment_failed / abstained). En ese caso, si la pregunta es de "
+            "definición o funcionamiento (qué es, cómo funciona, en qué se diferencia), llámala en vez de "
+            "escalate. Nunca para cantidades, plazos, porcentajes ni derechos concretos de la persona: esas "
             "preguntas se derivan. La respuesta se muestra marcada como información general."
         ),
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
